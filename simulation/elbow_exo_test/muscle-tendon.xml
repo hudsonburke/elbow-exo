@@ -1,0 +1,32 @@
+<mujoco model="mckibben_example">
+  <compiler angle="radian" coordinate="local"/>
+
+  <option gravity="0 0 -9.81"/>
+
+  <worldbody>
+    <!-- Upper arm fixed to world -->
+    <body name="upper_arm" pos="0 0 0">
+      <geom type="capsule" fromto="0 0 0 0 0 0.2" size="0.03" rgba="0.8 0.6 0.4 1"/>
+      <site name="bicep_origin" pos="0 0 0.2" size="0.005" rgba="1 0 0 1"/>
+      
+      <!-- Forearm connected via elbow joint -->
+      <body name="forearm" pos="0 0 0.2">
+        <joint name="elbow_flex" type="hinge" pos="0 0 0" axis="0 1 0" range="0 2.0"/>
+        <geom type="capsule" fromto="0 0 0 0 0 0.2" size="0.025" rgba="0.4 0.6 0.8 1"/>
+        <site name="forearm_insertion" pos="0 0 0.2" size="0.005" rgba="0 1 0 1"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <tendon>
+    <spatial name="mckibben_tendon">
+      <site site="bicep_origin"/>
+      <site site="forearm_insertion"/>
+    </spatial>
+  </tendon>
+
+  <actuator>
+    <muscle name="mckibben_muscle" tendon="mckibben_tendon" range="0 1" force="150" lmin="0.5" lmax="1.5" fpmax="1.0" lengthrange="0.2 0.3"/>
+  </actuator>
+
+</mujoco>
