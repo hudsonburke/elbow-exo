@@ -1,0 +1,3 @@
+[submodule "simulation/myosuite"]
+	path = simulation/myosuite
+	url = https://github.com/MyoHub/myosuite
