@@ -1,3 +1,6 @@
 [submodule "simulation/myosuite"]
 	path = simulation/myosuite
 	url = https://github.com/MyoHub/myosuite
+[submodule "simulation/myo_model"]
+	path = simulation/myo_model
+	url = https://github.com/myolab/myo_model.git
