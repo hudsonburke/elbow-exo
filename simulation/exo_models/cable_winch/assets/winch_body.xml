@@ -1,0 +1,24 @@
+<mujocoinclude model="winch">
+
+  <extension>
+    <plugin plugin="mujoco.elasticity.cable"/>
+  </extension>
+
+  <body name="winch" pos="0 0 0.13">
+    <joint name="winch"/>
+    <geom type="cylinder" size="0.1 0.1"/>
+    <geom type="cylinder" size="0.2 0.01" pos="0 0 -0.11"/>
+    <body name="B0" pos="0.11 0 0">
+      <inertial mass="0.01" diaginertia="0.0001 0.0001 0.0001" pos="0 0 0"/>
+      <joint type="ball"/>
+      <composite prefix="actuated" type="cable" curve="s" count="100 1 1"
+                  size="10 .15 4" offset="0 0 0" initial="ball">
+          <joint kind="main" damping="0.15" armature="0.01"/>
+          <geom type="capsule" size=".005" rgba=".8 .2 .1 1"/>
+      </composite>
+    </body>        
+  </body>
+  <actuator>
+    <velocity name="winch" joint="winch" kv="200" ctrllimited="true" ctrlrange="-10 10"/>
+  </actuator>
+</mujocoinclude>
