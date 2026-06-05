@@ -1,0 +1,6 @@
+CompileFlags:
+  CompilationDatabase: .
+
+  Add:
+    - "-D__INT32_TYPE__= long int"
+    - -Wno-macro-redefined
