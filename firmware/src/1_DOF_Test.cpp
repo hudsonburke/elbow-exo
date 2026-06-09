@@ -18,26 +18,33 @@ float yawZero = 0.0;
 float pitchZero = 0.0;
 float rollZero = 0.0;
 
-// Corrected IMU angles
+// Raw IMU angle differences
 float yawAngle = 0.0;
-float pitchAngle = 0.0;
+float rawPitchAngle = 0.0;
 float rollAngle = 0.0;
+
+// Corrected pitch angle used for control
+float pitchAngle = 0.0;
+
+// If your physical +90 reads as raw -90, keep this as -1.
+// If your physical +90 reads as raw +90, change this to 1.
+const int PITCH_SIGN = -1;
 
 // ----------------------
 // Motor 1 pins
 // ----------------------
 #define M1_IN1 5
 #define M1_IN2 6
-#define M1_ENCA 2   // Encoder 1 Yellow Wire, Uno interrupt pin
-#define M1_ENCB 4   // Encoder 1 White Wire
+#define M1_ENCA 2
+#define M1_ENCB 4
 
 // ----------------------
 // Motor 2 pins
 // ----------------------
 #define M2_IN1 9
 #define M2_IN2 10
-#define M2_ENCA 3   // Encoder 2 Yellow Wire, Uno interrupt pin
-#define M2_ENCB 7   // Encoder 2 White Wire
+#define M2_ENCA 3
+#define M2_ENCB 7
 
 // ----------------------
 // Encoder positions
@@ -56,7 +63,7 @@ const int REVERSE = -1;
 // ----------------------
 const int MOTOR_COUNTS_PER_REV_FULL = 64;
 const int GEAR_RATIO = 270;
-const int OUTPUT_COUNTS_PER_REV = MOTOR_COUNTS_PER_REV_FULL * GEAR_RATIO; // Check this value
+const int OUTPUT_COUNTS_PER_REV = MOTOR_COUNTS_PER_REV_FULL * GEAR_RATIO;
 
 const int ENCODER_SIGN_1 = 1;
 const int ENCODER_SIGN_2 = 1;
@@ -83,11 +90,21 @@ const int MAX_PWM = 255;
 const int TOLERANCE_COUNTS = 10;
 
 // ----------------------
+// IMU angle control settings
+// ----------------------
+const float IMU_PITCH_TOLERANCE_DEG = 1.0;
+
+// If it overshoots past 90, increase this to 2, 3, 5, etc.
+const float IMU_STOP_LEAD_DEG = 0.0;
+
+// Slow down when close to target angle
+const float IMU_SLOW_ZONE_DEG = 15.0;
+const int IMU_SLOW_PWM = 125;
+
+// ----------------------
 // Timing
 // ----------------------
 const unsigned long CONTROL_PERIOD_US = 10000; // 10 ms
-
-// Slower serial output
 const unsigned long PLOT_INTERVAL_MS = 250;
 
 unsigned long lastControlTime = 0;
@@ -117,6 +134,8 @@ void readEncoder2();
 
 void moveMotor1ByDegrees(float degrees, int direction, int maxPwm);
 void moveMotor2ByDegrees(float degrees, int direction, int maxPwm);
+void moveMotor2ToPitch(float targetPitch, int direction, int maxPwm, float encoderSafetyDegrees);
+
 void holdTargetsFor(unsigned long holdTimeMs);
 
 void setMotor1RelativeTarget(float degrees, int direction, int maxPwm);
@@ -128,6 +147,7 @@ void updateMotor2PID(float dt);
 
 bool motor1TargetReached();
 bool motor2TargetReached();
+bool imuPitchTargetReached(float targetPitch, float startPitch);
 
 long getMotor1Position();
 long getMotor2Position();
@@ -145,7 +165,6 @@ void brakeMotor2();
 
 void printData();
 
-// IMU function declarations
 float angleDifference(float currentAngle, float zeroAngle);
 void setupIMU();
 void recalibrateIMU();
@@ -195,17 +214,32 @@ void setup() {
 
   lastControlTime = micros();
 
-  Serial.println("target1 pos1 error1 target2 pos2 error2 pitchAngle");
+  Serial.println("target2 pos2 error2 pitchAngle rawPitch yawAngle rollAngle");
   Serial.println("Type r in the Serial Monitor to recalibrate IMU to 0.");
 
   // ----------------------
-  // Motion sequence
+  // Wait before motor starts
   // ----------------------
-  delay(5000);
-  moveMotor2ByDegrees(220.0, FORWARD, 160);
+  stopMotor1();
+  stopMotor2();
+
+  Serial.println("Waiting 10 seconds before starting motor...");
+  delay(10000);
+
+  Serial.println("Starting motion sequence...");
+
+  // ----------------------
+  // Motion sequence using IMU control
+  // ----------------------
+
+  // Move until corrected IMU pitch reaches +90 degrees.
+  // Encoder movement of 220 degrees is only a safety limit.
+  moveMotor2ToPitch(90.0, FORWARD, 160, 220.0);
   holdTargetsFor(3000);
-  
-  moveMotor2ByDegrees(200.0, REVERSE, 160);
+
+  // Move back until corrected IMU pitch reaches 0 degrees.
+  // Encoder movement of 240 degrees is only a safety limit.
+  moveMotor2ToPitch(0.0, REVERSE, 160, 240.0);
   holdTargetsFor(3000);
 
   Serial.println("Sequence complete. Holding final targets.");
@@ -252,7 +286,6 @@ void setupIMU() {
 
   delay(500);
 
-  // Make current IMU position equal to 0
   recalibrateIMU();
 }
 
@@ -269,6 +302,7 @@ void recalibrateIMU() {
   rollZero = event.orientation.z;
 
   yawAngle = 0.0;
+  rawPitchAngle = 0.0;
   pitchAngle = 0.0;
   rollAngle = 0.0;
 
@@ -285,8 +319,12 @@ void updateIMU() {
 
   yawAngle = angleDifference(event.orientation.x, yawZero);
 
-  // This sign is flipped so your physical +90 becomes +90
-  pitchAngle = -angleDifference(event.orientation.y, pitchZero);
+  // Raw pitch from IMU after zeroing
+  rawPitchAngle = angleDifference(event.orientation.y, pitchZero);
+
+  // Corrected pitch used by motor control
+  // Example: rawPitch = -90, pitchAngle = +90
+  pitchAngle = PITCH_SIGN * rawPitchAngle;
 
   rollAngle = angleDifference(event.orientation.z, rollZero);
 }
@@ -351,6 +389,67 @@ void moveMotor2ByDegrees(float degrees, int direction, int maxPwm) {
   }
 
   brakeMotor2();
+}
+
+void moveMotor2ToPitch(float targetPitch, int direction, int maxPwm, float encoderSafetyDegrees) {
+  updateIMU();
+
+  float startPitch = pitchAngle;
+
+  long startPos = getMotor2Position();
+  long safetyMoveCounts = degreesToCounts(encoderSafetyDegrees);
+
+  // Encoder target is now only a safety limit
+  target2 = startPos + direction * safetyMoveCounts;
+
+  activeMaxPwm2 = constrain(maxPwm, MIN_PWM, MAX_PWM);
+
+  eintegral2 = 0.0;
+  eprev2 = target2 - getMotor2Position();
+
+  Serial.print("Moving motor 2 to corrected IMU pitch target: ");
+  Serial.println(targetPitch);
+
+  while (!imuPitchTargetReached(targetPitch, startPitch)) {
+    checkSerialCommands();
+    updateIMU();
+
+    float pitchError = targetPitch - pitchAngle;
+    float absPitchError = fabs(pitchError);
+
+    // Slow down when close to IMU target
+    if (absPitchError <= IMU_SLOW_ZONE_DEG) {
+      activeMaxPwm2 = constrain(IMU_SLOW_PWM, MIN_PWM, maxPwm);
+    } 
+    else {
+      activeMaxPwm2 = constrain(maxPwm, MIN_PWM, MAX_PWM);
+    }
+
+    // Encoder safety stop
+    long encoderError = target2 - getMotor2Position();
+
+    if (labs(encoderError) <= TOLERANCE_COUNTS) {
+      Serial.println("Encoder safety limit reached before IMU target.");
+      break;
+    }
+
+    updateBothPositionPID();
+    delay(1);
+  }
+
+  brakeMotor2();
+
+  // Lock target to current encoder position so PID does not continue moving
+  target2 = getMotor2Position();
+  eprev2 = 0.0;
+  eintegral2 = 0.0;
+
+  updateIMU();
+
+  Serial.print("Motor 2 stopped by IMU. Final corrected pitchAngle: ");
+  Serial.print(pitchAngle);
+  Serial.print(" rawPitch: ");
+  Serial.println(rawPitchAngle);
 }
 
 void holdTargetsFor(unsigned long holdTimeMs) {
@@ -423,7 +522,6 @@ void updateMotor1PID(float dt) {
   }
 
   float dedt = (error - eprev1) / dt;
-
   eintegral1 = eintegral1 + error * dt;
 
   if (eintegral1 > 300) {
@@ -473,7 +571,6 @@ void updateMotor2PID(float dt) {
   }
 
   float dedt = (error - eprev2) / dt;
-
   eintegral2 = eintegral2 + error * dt;
 
   if (eintegral2 > 300) {
@@ -521,6 +618,18 @@ bool motor1TargetReached() {
 bool motor2TargetReached() {
   long error = target2 - getMotor2Position();
   return labs(error) <= TOLERANCE_COUNTS;
+}
+
+bool imuPitchTargetReached(float targetPitch, float startPitch) {
+  if (targetPitch > startPitch) {
+    return pitchAngle >= targetPitch - IMU_STOP_LEAD_DEG;
+  }
+
+  if (targetPitch < startPitch) {
+    return pitchAngle <= targetPitch + IMU_STOP_LEAD_DEG;
+  }
+
+  return fabs(pitchAngle - targetPitch) <= IMU_PITCH_TOLERANCE_DEG;
 }
 
 // ----------------------
@@ -623,13 +732,8 @@ void printData() {
   if (millis() - lastPlotTime >= PLOT_INTERVAL_MS) {
     lastPlotTime = millis();
 
-    long currentPos1 = getMotor1Position();
     long currentPos2 = getMotor2Position();
-
-    long error1 = target1 - currentPos1;
     long error2 = target2 - currentPos2;
-
-
 
     Serial.print("target2:");
     Serial.print(target2);
@@ -645,12 +749,14 @@ void printData() {
 
     Serial.print("pitchAngle:");
     Serial.print(pitchAngle);
+    Serial.print(" ");
 
+    Serial.print("rawPitch:");
+    Serial.print(rawPitchAngle);
     Serial.print(" ");
 
     Serial.print("yawAngle:");
     Serial.print(yawAngle);
-
     Serial.print(" ");
 
     Serial.print("rollAngle:");
