@@ -1,54 +1,103 @@
-// #include <Arduino.h>
-// #include <Encoder.h>
+// #include <Wire.h>
+// #include <Adafruit_Sensor.h>
+// #include <Adafruit_BNO055.h>
+// #include <utility/imumaths.h>
 
+// Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
-// #define DRIVER1_IN1 4
-// #define DRIVER1_IN2 5
-// #define ENC1_A 6 // Encoder Yellow Wire 
-// #define ENC1_B 7 //Endoder White Wire
+// // Zero/reference values
+// float yawZero = 0.0;
+// float pitchZero = 0.0;
+// float rollZero = 0.0;
 
-// #define DRIVER2_IN1 11
-// #define DRIVER2_IN2 10
-// #define ENC2_A 8 // Encoder Yellow Wire 
-// #define ENC2_B 9 //Endoder White Wire
+// // Corrected angle values
+// float yawAngle = 0.0;
+// float pitchAngle = 0.0;
+// float rollAngle = 0.0;
 
-// const int MOTOR_COUNTS_PER_REV = 64; // Number of encoder counts per revolution
-// const int GEAR_RATIO = 19; // Gear ratio of the motor 19:1
-// const int COUNTS_PER_REV = MOTOR_COUNTS_PER_REV * GEAR_RATIO; // Total counts per revolution of the output shaft
+// // This handles wrap-around, like 359 degrees to 0 degrees
+// float angleDifference(float currentAngle, float zeroAngle) {
+//   float diff = currentAngle - zeroAngle;
+
+//   while (diff > 180.0) {
+//     diff -= 360.0;
+//   }
+
+//   while (diff < -180.0) {
+//     diff += 360.0;
+//   }
+
+//   return diff;
+// }
+
+// void recalibrateIMU() {
+//   sensors_event_t event;
+//   bno.getEvent(&event);
+
+//   yawZero = event.orientation.x;
+//   pitchZero = event.orientation.y;
+//   rollZero = event.orientation.z;
+
+//   Serial.println("IMU recalibrated. Current position is now 0.");
+// }
 
 // void setup() {
-//   pinMode(DRIVER1_IN1, OUTPUT);
-//   pinMode(DRIVER1_IN2, OUTPUT);
-//   pinMode(DRIVER2_IN1, OUTPUT);
-//   pinMode(DRIVER2_IN2, OUTPUT);
-//   pinMode(ENC1_A, INPUT);
-//   pinMode(ENC1_B, INPUT);
-//   pinMode(ENC2_A, INPUT);
-//   pinMode(ENC2_B, INPUT);
+//   Serial.begin(9600);
+//   delay(1000);
+
+//   Serial.println("BNO055 IMU Test");
+
+//   Wire.begin();
+
+//   if (!bno.begin()) {
+//     Serial.println("BNO055 not detected. Check wiring or I2C address.");
+//     while (1);
+//   }
+
+//   delay(1000);
+//   bno.setExtCrystalUse(true);
+
+//   Serial.println("BNO055 detected!");
+
+//   delay(500);
+
+//   // Make current secured position equal to zero
+//   recalibrateIMU();
+
+//   Serial.println("Type r to recalibrate again.");
 // }
 
 // void loop() {
-//   // Move forward
-//   digitalWrite(DRIVER1_IN1, HIGH);
-//   digitalWrite(DRIVER1_IN2, LOW);
-//   digitalWrite(DRIVER2_IN1, HIGH);
-//   digitalWrite(DRIVER2_IN2, LOW);
-//   delay(2000);
+//   if (Serial.available() > 0) {
+//     char command = Serial.read();
 
-//   // Move backward
-//   digitalWrite(DRIVER1_IN1, LOW);
-//   digitalWrite(DRIVER1_IN2, HIGH);
-//   digitalWrite(DRIVER2_IN1, LOW);
-//   digitalWrite(DRIVER2_IN2, HIGH);
-//   delay(2000);
+//     if (command == 'r' || command == 'R') {
+//       recalibrateIMU();
+//     }
+//   }
 
-//   // Stop
-//   digitalWrite(DRIVER1_IN1, LOW);
-//   digitalWrite(DRIVER1_IN2, LOW);
-//   digitalWrite(DRIVER2_IN1, LOW);
-//   digitalWrite(DRIVER2_IN2, LOW);
-//   delay(2000);
+//   sensors_event_t event;
+//   bno.getEvent(&event);
+
+//   // Raw differences from starting position
+//   yawAngle = angleDifference(event.orientation.x, yawZero);
+
+//   // Flipped sign so your physical +90 becomes +90
+//   pitchAngle = -angleDifference(event.orientation.y, pitchZero);
+
+//   rollAngle = angleDifference(event.orientation.z, rollZero);
+
+//   Serial.print("Corrected Pitch Angle: ");
+//   Serial.print(pitchAngle);
+
+//   Serial.print(" | Raw Pitch/Y: ");
+//   Serial.print(event.orientation.y);
+
+//   Serial.print(" | Raw Yaw/X: ");
+//   Serial.print(event.orientation.x);
+
+//   Serial.print(" | Raw Roll/Z: ");
+//   Serial.println(event.orientation.z);
+
+//   delay(500);
 // }
-
-
-

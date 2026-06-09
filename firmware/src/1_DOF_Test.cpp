@@ -1,6 +1,28 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+// ----------------------
+// IMU setup
+// ----------------------
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
+
+bool imuOK = false;
+
+// IMU zero/reference values
+float yawZero = 0.0;
+float pitchZero = 0.0;
+float rollZero = 0.0;
+
+// Corrected IMU angles
+float yawAngle = 0.0;
+float pitchAngle = 0.0;
+float rollAngle = 0.0;
+
 // ----------------------
 // Motor 1 pins
 // ----------------------
@@ -34,7 +56,7 @@ const int REVERSE = -1;
 // ----------------------
 const int MOTOR_COUNTS_PER_REV_FULL = 64;
 const int GEAR_RATIO = 270;
-const int OUTPUT_COUNTS_PER_REV = MOTOR_COUNTS_PER_REV_FULL * GEAR_RATIO; // 1216 counts/rev
+const int OUTPUT_COUNTS_PER_REV = MOTOR_COUNTS_PER_REV_FULL * GEAR_RATIO; // Check this value
 
 const int ENCODER_SIGN_1 = 1;
 const int ENCODER_SIGN_2 = 1;
@@ -64,7 +86,9 @@ const int TOLERANCE_COUNTS = 10;
 // Timing
 // ----------------------
 const unsigned long CONTROL_PERIOD_US = 10000; // 10 ms
-const unsigned long PLOT_INTERVAL_MS = 50;
+
+// Slower serial output
+const unsigned long PLOT_INTERVAL_MS = 250;
 
 unsigned long lastControlTime = 0;
 unsigned long lastPlotTime = 0;
@@ -121,9 +145,21 @@ void brakeMotor2();
 
 void printData();
 
+// IMU function declarations
+float angleDifference(float currentAngle, float zeroAngle);
+void setupIMU();
+void recalibrateIMU();
+void updateIMU();
+void checkSerialCommands();
+
 void setup() {
   Serial.begin(9600);
   delay(2000);
+
+  // ----------------------
+  // IMU setup
+  // ----------------------
+  setupIMU();
 
   // ----------------------
   // Encoder setup
@@ -159,32 +195,110 @@ void setup() {
 
   lastControlTime = micros();
 
-  Serial.println("target1 pos1 error1 target2 pos2 error2");
+  Serial.println("target1 pos1 error1 target2 pos2 error2 pitchAngle");
+  Serial.println("Type r in the Serial Monitor to recalibrate IMU to 0.");
 
   // ----------------------
   // Motion sequence
   // ----------------------
-
-  
-
-  moveMotor2ByDegrees(220.0, FORWARD, 180);
-  holdTargetsFor(3000);
-
-  moveMotor2ByDegrees(220.0, REVERSE, 180);
+  delay(5000);
+  moveMotor2ByDegrees(220.0, FORWARD, 160);
   holdTargetsFor(3000);
   
-
-  
-
-
-
-
+  moveMotor2ByDegrees(200.0, REVERSE, 160);
+  holdTargetsFor(3000);
 
   Serial.println("Sequence complete. Holding final targets.");
 }
 
 void loop() {
   updateBothPositionPID();
+}
+
+// ----------------------
+// IMU functions
+// ----------------------
+
+float angleDifference(float currentAngle, float zeroAngle) {
+  float diff = currentAngle - zeroAngle;
+
+  while (diff > 180.0) {
+    diff -= 360.0;
+  }
+
+  while (diff < -180.0) {
+    diff += 360.0;
+  }
+
+  return diff;
+}
+
+void setupIMU() {
+  Serial.println("Starting BNO055 IMU...");
+
+  Wire.begin();
+
+  if (!bno.begin()) {
+    Serial.println("BNO055 not detected. Check wiring or I2C address.");
+    imuOK = false;
+    return;
+  }
+
+  delay(1000);
+  bno.setExtCrystalUse(true);
+
+  imuOK = true;
+  Serial.println("BNO055 detected!");
+
+  delay(500);
+
+  // Make current IMU position equal to 0
+  recalibrateIMU();
+}
+
+void recalibrateIMU() {
+  if (!imuOK) {
+    return;
+  }
+
+  sensors_event_t event;
+  bno.getEvent(&event);
+
+  yawZero = event.orientation.x;
+  pitchZero = event.orientation.y;
+  rollZero = event.orientation.z;
+
+  yawAngle = 0.0;
+  pitchAngle = 0.0;
+  rollAngle = 0.0;
+
+  Serial.println("IMU recalibrated. Current position is now 0.");
+}
+
+void updateIMU() {
+  if (!imuOK) {
+    return;
+  }
+
+  sensors_event_t event;
+  bno.getEvent(&event);
+
+  yawAngle = angleDifference(event.orientation.x, yawZero);
+
+  // This sign is flipped so your physical +90 becomes +90
+  pitchAngle = -angleDifference(event.orientation.y, pitchZero);
+
+  rollAngle = angleDifference(event.orientation.z, rollZero);
+}
+
+void checkSerialCommands() {
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+
+    if (command == 'r' || command == 'R') {
+      recalibrateIMU();
+    }
+  }
 }
 
 // ----------------------
@@ -273,6 +387,8 @@ void setMotor2RelativeTarget(float degrees, int direction, int maxPwm) {
 // ----------------------
 
 void updateBothPositionPID() {
+  checkSerialCommands();
+
   unsigned long now = micros();
 
   if (now - lastControlTime < CONTROL_PERIOD_US) {
@@ -289,6 +405,7 @@ void updateBothPositionPID() {
   updateMotor1PID(dt);
   updateMotor2PID(dt);
 
+  updateIMU();
   printData();
 }
 
@@ -512,17 +629,7 @@ void printData() {
     long error1 = target1 - currentPos1;
     long error2 = target2 - currentPos2;
 
-    Serial.print("target1:");
-    Serial.print(target1);
-    Serial.print(" ");
 
-    Serial.print("pos1:");
-    Serial.print(currentPos1);
-    Serial.print(" ");
-
-    Serial.print("error1:");
-    Serial.print(error1);
-    Serial.print(" ");
 
     Serial.print("target2:");
     Serial.print(target2);
@@ -533,6 +640,20 @@ void printData() {
     Serial.print(" ");
 
     Serial.print("error2:");
-    Serial.println(error2);
+    Serial.print(error2);
+    Serial.print(" ");
+
+    Serial.print("pitchAngle:");
+    Serial.print(pitchAngle);
+
+    Serial.print(" ");
+
+    Serial.print("yawAngle:");
+    Serial.print(yawAngle);
+
+    Serial.print(" ");
+
+    Serial.print("rollAngle:");
+    Serial.println(rollAngle);
   }
-}     
+}
