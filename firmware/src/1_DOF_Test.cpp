@@ -122,7 +122,7 @@ void brakeMotor2();
 void printData();
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   delay(2000);
 
   // ----------------------
@@ -165,11 +165,15 @@ void setup() {
   // Motion sequence
   // ----------------------
 
-  moveMotor2ByDegrees(220.0, REVERSE, 220);
+  
+
+  moveMotor2ByDegrees(220.0, FORWARD, 180);
   holdTargetsFor(3000);
 
-  moveMotor2ByDegrees(220.0, FORWARD, 220);
+  moveMotor2ByDegrees(220.0, REVERSE, 180);
   holdTargetsFor(3000);
+  
+
   
 
 
@@ -531,4 +535,4 @@ void printData() {
     Serial.print("error2:");
     Serial.println(error2);
   }
-}      
+}     
