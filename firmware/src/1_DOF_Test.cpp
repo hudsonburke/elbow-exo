@@ -8,517 +8,470 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
-
-// IMU setup
-Adafruit_BNO055 imuSensor = Adafruit_BNO055(55, 0x28, &Wire);
-
-bool isImuConnected = false;
-
-// IMU zero/reference values
-float yawZeroOffsetDeg = 0.0;
-float pitchZeroOffsetDeg = 0.0;
-float rollZeroOffsetDeg = 0.0;
-
-// IMU angle values
-float yawDeg = 0.0;
-float rawPitchDeg = 0.0;
-float correctedPitchDeg = 0.0;
-float rollDeg = 0.0;
-
-// depending on IMU orientation, you may need to invert the pitch angle
-const int PITCH_DIRECTION_SIGN = -1;
-
-// Motor 1 pins
-
-#define MOTOR1_IN1 5
-#define MOTOR1_IN2 6
-#define MOTOR1_ENCODER_A 2
-#define MOTOR1_ENCODER_B 4
+// IMU
 
 
-// Motor 2 pins
+// Do not name this "imu" because the Adafruit library already has a namespace called imu.
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
-#define MOTOR2_IN1 9
-#define MOTOR2_IN2 10
-#define MOTOR2_ENCODER_A 3
-#define MOTOR2_ENCODER_B 7
+bool imuReady = false;
+
+float pitchZero = 0.0;
+float rawPitch = 0.0;
+float currentPitch = 0.0;
+
+// If your IMU reads +90 as -90, keep this as -1.
+// If your IMU reads +90 as +90, change this to 1.
+const int PITCH_SIGN = -1;
 
 
-// Encoder library objects
-
-Encoder motor1Encoder(MOTOR1_ENCODER_A, MOTOR1_ENCODER_B);
-Encoder motor2Encoder(MOTOR2_ENCODER_A, MOTOR2_ENCODER_B);
+// MOTOR PINS
 
 
-// Direction constants
+// Motor 1
+#define M1_IN1 5
+#define M1_IN2 6
+#define M1_ENC_A 2
+#define M1_ENC_B 4
 
-const int MOTOR_FORWARD = 1;
-const int MOTOR_REVERSE = -1;
+// Motor 2
+#define M2_IN1 9
+#define M2_IN2 10
+#define M2_ENC_A 3
+#define M2_ENC_B 7
 
-// Encoder / gearbox settings
+// Encoder objects
+Encoder enc1(M1_ENC_A, M1_ENC_B);
+Encoder enc2(M2_ENC_A, M2_ENC_B);
 
-const int MOTOR_COUNTS_PER_REV_FULL = 64;
+// DIRECTION SETTINGS
+
+
+const int FORWARD = 1;
+const int REVERSE = -1;
+
+// Change these to -1 if encoder counts go the wrong way
+const int M1_ENC_SIGN = 1;
+const int M2_ENC_SIGN = 1;
+
+// Change these to -1 if motor moves the wrong way
+const int M1_MOTOR_SIGN = 1;
+const int M2_MOTOR_SIGN = 1;
+
+
+// ENCODER / GEARBOX SETTINGS
+
+
+const int COUNTS_PER_MOTOR_REV = 64;
 const int GEAR_RATIO = 270;
-const int OUTPUT_COUNTS_PER_REV = MOTOR_COUNTS_PER_REV_FULL * GEAR_RATIO;
-
-const int MOTOR1_ENCODER_DIRECTION_SIGN = 1;
-const int MOTOR2_ENCODER_DIRECTION_SIGN = 1;
-
-// Motor 1 still uses encoder PID
-const int MOTOR1_OUTPUT_DIRECTION_SIGN = 1;
-
-// If motor 2 moves the wrong direction using IMU PID, change this to -1.
-const int MOTOR2_IMU_OUTPUT_DIRECTION_SIGN = 1;
+const int COUNTS_PER_OUTPUT_REV = COUNTS_PER_MOTOR_REV * GEAR_RATIO;
 
 
-// Motor 1 encoder PID constants
-
-float motor1Kp = 0.12;
-float motor1Kd = 0.012;
-float motor1Ki = 0.0;
-
-// Motor 2 IMU PID constants
-
-// Error is in degrees, not encoder counts.
-float motor2PitchKp = 4.0;
-float motor2PitchKd = 0.15;
-float motor2PitchKi = 0.0;
+// PID VALUES
 
 
-// Motor limits
+// Motor 1 uses encoder PID
+float m1Kp = 0.12;
+float m1Kd = 0.012;
+float m1Ki = 0.0;
+
+// Motor 2 uses IMU pitch PID
+float m2Kp = 4.0;
+float m2Kd = 0.15;
+float m2Ki = 0.0;
+
+
+// MOTOR LIMITS
 
 const int MIN_PWM = 125;
 const int MAX_PWM = 255;
 
+const int M1_COUNT_TOLERANCE = 10;
 
-// Motor 1 encoder tolerance
-
-const int MOTOR1_ENCODER_TOLERANCE_COUNTS = 10;
-
-
-// Motor 2 IMU angle tolerance
-
-const float MOTOR2_PITCH_TOLERANCE_DEG = 1.0;
-
-// Slow down when close to target angle
-const float MOTOR2_PITCH_SLOW_ZONE_DEG = 15.0;
-const int MOTOR2_SLOW_PWM = 130;
-
-// Timing
-
-const unsigned long CONTROL_UPDATE_PERIOD_US = 10000; // 10 ms
-const unsigned long TELEMETRY_PRINT_INTERVAL_MS = 250;
-
-unsigned long lastControlUpdateMicros = 0;
-unsigned long lastTelemetryPrintMillis = 0;
+const float M2_PITCH_TOLERANCE = 1.0;
+const float M2_SLOW_ZONE = 15.0;
+const int M2_SLOW_PWM = 130;
 
 
-// Motor 1 encoder controller variables
-
-long motor1TargetEncoderCounts = 0;
-float motor1PreviousError = 0.0;
-float motor1IntegralError = 0.0;
-int motor1ActiveMaxPwm = 220;
+// TIME SETTINGS
 
 
-// Motor 2 IMU pitch controller variables
+const unsigned long CONTROL_TIME_US = 10000; // 10 ms
+const unsigned long PRINT_TIME_MS = 250;
 
-float motor2TargetPitchDeg = 0.0;
-float motor2PreviousPitchError = 0.0;
-float motor2IntegralPitchError = 0.0;
-int motor2ActiveMaxPwm = 160;
+unsigned long lastControlTime = 0;
+unsigned long lastPrintTime = 0;
 
-// Function declarations
 
-void moveMotor1ByEncoderDegrees(float degrees, int direction, int maxPwm);
-void moveMotor2ToPitchAngle(float targetPitchDeg, int maxPwm);
+// MOTOR 1 CONTROL VARIABLES
 
-void holdCurrentTargetsFor(unsigned long holdTimeMs);
 
-void setMotor1RelativeEncoderTarget(float degrees, int direction, int maxPwm);
-void setMotor2PitchTarget(float targetPitchDeg, int maxPwm);
+long m1TargetCounts = 0;
+float m1LastError = 0.0;
+float m1ErrorSum = 0.0;
+int m1MaxPwm = 220;
 
-void updateMotorControllers();
-void updateMotor1EncoderPositionPid(float dt);
-void updateMotor2ImuPitchPid(float dt);
+// MOTOR 2 CONTROL VARIABLES
 
-bool isMotor1EncoderTargetReached();
-bool isMotor2PitchTargetReached();
 
-long getMotor1EncoderCounts();
-long getMotor2EncoderCounts();
+float targetPitch = 0.0;
+float lastPitchError = 0.0;
+float pitchErrorSum = 0.0;
+int m2MaxPwm = 180;
 
-long motorDegreesToEncoderCounts(float degrees);
-float encoderCountsToMotorDegrees(long counts);
 
-void driveMotor1(int direction, int pwmValue);
-void driveMotor2(int direction, int pwmValue);
+// FUNCTION DECLARATIONS
 
-void stopMotor1();
-void stopMotor2();
-void brakeMotor1();
-void brakeMotor2();
 
-void printTelemetry();
+void startImu();
+void zeroImu();
+void readPitch();
+float angleDiff(float currentAngle, float zeroAngle);
 
-float getAngleDifferenceDeg(float currentAngleDeg, float zeroAngleDeg);
-void initializeImu();
-void zeroImuAtCurrentPosition();
-void updateImuAngles();
-void handleSerialCommands();
+void moveM1Degrees(float degrees, int direction, int maxPwm);
+void moveM2ToPitch(float newTargetPitch, int maxPwm);
+void holdTargets(unsigned long holdTimeMs);
+
+void setM1Target(float degrees, int direction, int maxPwm);
+
+void updateMotors();
+void updateM1Pid(float dt);
+void updateM2Pid(float dt);
+
+bool m1AtTarget();
+bool m2AtTarget();
+
+long readM1Counts();
+long readM2Counts();
+
+long degreesToCounts(float degrees);
+float countsToDegrees(long counts);
+
+void runM1(int direction, int pwmValue);
+void runM2(int direction, int pwmValue);
+
+void stopM1();
+void stopM2();
+void brakeM1();
+void brakeM2();
+
+void checkSerial();
+void printData();
+
+
+// SETUP
+
 
 void setup() {
   Serial.begin(9600);
   delay(2000);
 
-  // IMU setup
-  
-  initializeImu();
+  startImu();
 
-  // Motor setup
+  pinMode(M1_IN1, OUTPUT);
+  pinMode(M1_IN2, OUTPUT);
+  pinMode(M2_IN1, OUTPUT);
+  pinMode(M2_IN2, OUTPUT);
 
-  pinMode(MOTOR1_IN1, OUTPUT);
-  pinMode(MOTOR1_IN2, OUTPUT);
-  pinMode(MOTOR2_IN1, OUTPUT);
-  pinMode(MOTOR2_IN2, OUTPUT);
+  stopM1();
+  stopM2();
 
-  stopMotor1();
-  stopMotor2();
+  enc1.write(0);
+  enc2.write(0);
 
+  m1TargetCounts = readM1Counts();
 
-  // Reset encoder counts using Encoder library
+  readPitch();
+  targetPitch = currentPitch;
 
-  motor1Encoder.write(0);
-  motor2Encoder.write(0);
+  lastControlTime = micros();
 
-  motor1TargetEncoderCounts = getMotor1EncoderCounts();
-
-  updateImuAngles();
-  motor2TargetPitchDeg = correctedPitchDeg;
-
-  lastControlUpdateMicros = micros();
-
-  Serial.println("targetPitchDeg | correctedPitchDeg | pitchErrorDeg | rawPitchDeg | motor2EncoderCounts");
+  Serial.println("TargetDeg | CurrentDeg | ErrorDeg | RawPitch | M1Counts | M2Counts");
   Serial.println("Type r in the Serial Monitor to recalibrate IMU to 0.");
-
-
-  // Wait before motor starts
-
-  stopMotor1();
-  stopMotor2();
 
   Serial.println("Waiting 10 seconds before starting motor...");
   delay(10000);
 
+  // Reset time after the 10 second wait
+  lastControlTime = micros();
+
   Serial.println("Starting motion sequence...");
 
-  // Motion sequence using IMU PID control
+  // Current sequence only uses Motor 2.
+  moveM2ToPitch(90.0, 180);
+  holdTargets(3000);
 
-
-  moveMotor2ToPitchAngle(90.0, 180);
-  holdCurrentTargetsFor(3000);
-
-  moveMotor2ToPitchAngle(0.0, 180);
-  holdCurrentTargetsFor(3000);
+  moveM2ToPitch(0.0, 180);
+  holdTargets(3000);
 
   Serial.println();
-  Serial.println("Sequence complete. Holding final IMU target.");
+  Serial.println("Sequence complete. Holding final target.");
   Serial.println();
 }
+
+
+// LOOP
+
 
 void loop() {
-  updateMotorControllers();
+  updateMotors();
 }
 
 
-// IMU functions
+// IMU FUNCTIONS
 
-
-float getAngleDifferenceDeg(float currentAngleDeg, float zeroAngleDeg) {
-  float differenceDeg = currentAngleDeg - zeroAngleDeg;
-
-  while (differenceDeg > 180.0) {
-    differenceDeg -= 360.0;
-  }
-
-  while (differenceDeg < -180.0) {
-    differenceDeg += 360.0;
-  }
-
-  return differenceDeg;
-}
-
-void initializeImu() {
+void startImu() {
   Serial.println("Starting BNO055 IMU...");
 
   Wire.begin();
 
-  if (!imuSensor.begin()) {
+  if (!bno.begin()) {
     Serial.println("BNO055 not detected. Check wiring or I2C address.");
-    isImuConnected = false;
+    imuReady = false;
     return;
   }
 
   delay(1000);
-  imuSensor.setExtCrystalUse(true);
+  bno.setExtCrystalUse(true);
 
-  isImuConnected = true;
+  imuReady = true;
   Serial.println("BNO055 detected!");
 
   delay(500);
 
-  zeroImuAtCurrentPosition();
+  zeroImu();
 }
 
-void zeroImuAtCurrentPosition() {
-  if (!isImuConnected) {
+void zeroImu() {
+  if (!imuReady) {
     return;
   }
 
-  sensors_event_t imuEvent;
-  imuSensor.getEvent(&imuEvent);
+  sensors_event_t event;
+  bno.getEvent(&event);
 
-  yawZeroOffsetDeg = imuEvent.orientation.x;
-  pitchZeroOffsetDeg = imuEvent.orientation.y;
-  rollZeroOffsetDeg = imuEvent.orientation.z;
+  pitchZero = event.orientation.y;
 
-  yawDeg = 0.0;
-  rawPitchDeg = 0.0;
-  correctedPitchDeg = 0.0;
-  rollDeg = 0.0;
-         
-  // Do not reset motor2TargetPitchDeg here.
-  // motor2TargetPitchDeg should only change inside moveMotor2ToPitchAngle().
+  rawPitch = 0.0;
+  currentPitch = 0.0;
 
-  motor2PreviousPitchError = 0.0;
-  motor2IntegralPitchError = 0.0;
+  lastPitchError = 0.0;
+  pitchErrorSum = 0.0;
 
   Serial.println("IMU recalibrated. Current position is now 0.");
 }
 
-void updateImuAngles() {
-  if (!isImuConnected) {
+void readPitch() {
+  if (!imuReady) {
     return;
   }
 
-  sensors_event_t imuEvent;
-  imuSensor.getEvent(&imuEvent);
+  sensors_event_t event;
+  bno.getEvent(&event);
 
-  yawDeg = getAngleDifferenceDeg(imuEvent.orientation.x, yawZeroOffsetDeg);
+  rawPitch = angleDiff(event.orientation.y, pitchZero);
 
-  // Raw pitch after zeroing
-  rawPitchDeg = getAngleDifferenceDeg(imuEvent.orientation.y, pitchZeroOffsetDeg);
-
-  // Corrected pitch used for PID control
-  // Example: rawPitchDeg = -90, correctedPitchDeg = +90
-  correctedPitchDeg = PITCH_DIRECTION_SIGN * rawPitchDeg;
-
-  rollDeg = getAngleDifferenceDeg(imuEvent.orientation.z, rollZeroOffsetDeg);
+  // Example:
+  // rawPitch = -90
+  // currentPitch = +90
+  currentPitch = PITCH_SIGN * rawPitch;
 }
 
-void handleSerialCommands() {
-  if (Serial.available() > 0) {
-    char command = Serial.read();
+float angleDiff(float currentAngle, float zeroAngle) {
+  float difference = currentAngle - zeroAngle;
 
-    if (command == 'r' || command == 'R') {
-      zeroImuAtCurrentPosition();
-    }
+  while (difference > 180.0) {
+    difference -= 360.0;
   }
+
+  while (difference < -180.0) {
+    difference += 360.0;
+  }
+
+  return difference;
 }
 
 
-// Motion command functions
+// MOTION COMMANDS
 
-void moveMotor1ByEncoderDegrees(float degrees, int direction, int maxPwm) {
-  setMotor1RelativeEncoderTarget(degrees, direction, maxPwm);
 
-  while (!isMotor1EncoderTargetReached()) {
-    updateMotorControllers();
+void moveM1Degrees(float degrees, int direction, int maxPwm) {
+  setM1Target(degrees, direction, maxPwm);
+
+  while (!m1AtTarget()) {
+    updateMotors();
     delay(1);
   }
 
-  brakeMotor1();
+  brakeM1();
 }
 
-void moveMotor2ToPitchAngle(float targetPitchDeg, int maxPwm) {
-  updateImuAngles();
+void moveM2ToPitch(float newTargetPitch, int maxPwm) {
+  readPitch();
 
-  motor2TargetPitchDeg = targetPitchDeg;
-  motor2ActiveMaxPwm = constrain(maxPwm, MIN_PWM, MAX_PWM);
+  targetPitch = newTargetPitch;
+  m2MaxPwm = constrain(maxPwm, MIN_PWM, MAX_PWM);
 
-  motor2IntegralPitchError = 0.0;
-  motor2PreviousPitchError = motor2TargetPitchDeg - correctedPitchDeg;
+  pitchErrorSum = 0.0;
+  lastPitchError = targetPitch - currentPitch;
 
-  Serial.print("Moving motor 2 using IMU PID to pitch target: ");
-  Serial.println(motor2TargetPitchDeg, 2);
+  Serial.print("Moving Motor 2 to target: ");
+  Serial.println(targetPitch, 2);
 
-  while (!isMotor2PitchTargetReached()) {
-    updateMotorControllers();
+  while (!m2AtTarget()) {
+    updateMotors();
     delay(1);
   }
 
-  brakeMotor2();
+  brakeM2();
 
-  Serial.print("Motor 2 reached IMU pitch target. Final correctedPitchDeg: ");
-  Serial.print(correctedPitchDeg, 2);
+  Serial.print("Motor 2 reached target. CurrentDeg: ");
+  Serial.print(currentPitch, 2);
 
-  Serial.print(" | rawPitchDeg: ");
-  Serial.print(rawPitchDeg, 2);
+  Serial.print(" | RawPitch: ");
+  Serial.print(rawPitch, 2);
 
-  Serial.print(" | motor2EncoderCounts: ");
-  Serial.println(getMotor2EncoderCounts());
+  Serial.print(" | M2Counts: ");
+  Serial.println(readM2Counts());
 }
 
-void holdCurrentTargetsFor(unsigned long holdTimeMs) {
-  unsigned long holdStartTime = millis();
+void holdTargets(unsigned long holdTimeMs) {
+  unsigned long startTime = millis();
 
-  while (millis() - holdStartTime < holdTimeMs) {
-    updateMotorControllers();
+  while (millis() - startTime < holdTimeMs) {
+    updateMotors();
     delay(1);
   }
 }
 
-void setMotor1RelativeEncoderTarget(float degrees, int direction, int maxPwm) {
-  long moveCounts = motorDegreesToEncoderCounts(degrees);
+void setM1Target(float degrees, int direction, int maxPwm) {
+  long moveCounts = degreesToCounts(degrees);
 
-  motor1TargetEncoderCounts = motor1TargetEncoderCounts + direction * moveCounts;
-  motor1ActiveMaxPwm = constrain(maxPwm, MIN_PWM, MAX_PWM);
+  m1TargetCounts += direction * moveCounts;
+  m1MaxPwm = constrain(maxPwm, MIN_PWM, MAX_PWM);
 
-  motor1IntegralError = 0.0;
-  motor1PreviousError = motor1TargetEncoderCounts - getMotor1EncoderCounts();
-}
-
-void setMotor2PitchTarget(float targetPitchDeg, int maxPwm) {
-  updateImuAngles();
-
-  motor2TargetPitchDeg = targetPitchDeg;
-  motor2ActiveMaxPwm = constrain(maxPwm, MIN_PWM, MAX_PWM);
-
-  motor2IntegralPitchError = 0.0;
-  motor2PreviousPitchError = motor2TargetPitchDeg - correctedPitchDeg;
+  m1ErrorSum = 0.0;
+  m1LastError = m1TargetCounts - readM1Counts();
 }
 
 
-// PID update functions
+// PID CONTROL
 
 
-void updateMotorControllers() {
-  handleSerialCommands();
+void updateMotors() {
+  checkSerial();
 
-  unsigned long nowMicros = micros();
+  unsigned long now = micros();
 
-  if (nowMicros - lastControlUpdateMicros < CONTROL_UPDATE_PERIOD_US) {
+  if (now - lastControlTime < CONTROL_TIME_US) {
     return;
   }
 
-  float dt = (nowMicros - lastControlUpdateMicros) / 1000000.0;
-  lastControlUpdateMicros = nowMicros;
+  float dt = (now - lastControlTime) / 1000000.0;
+  lastControlTime = now;
 
   if (dt <= 0) {
     dt = 0.001;
   }
 
-  // Motor 2 PID depends on IMU, so update IMU first
-  updateImuAngles();
+  readPitch();
 
-  updateMotor1EncoderPositionPid(dt);
-  updateMotor2ImuPitchPid(dt);
+  updateM1Pid(dt);
+  updateM2Pid(dt);
 
-  printTelemetry();
+  printData();
 }
 
-void updateMotor1EncoderPositionPid(float dt) {
-  long motor1CurrentCounts = getMotor1EncoderCounts();
+void updateM1Pid(float dt) {
+  long currentCounts = readM1Counts();
 
-  float motor1ErrorCounts = motor1TargetEncoderCounts - motor1CurrentCounts;
-  float motor1AbsErrorCounts = fabs(motor1ErrorCounts);
+  float error = m1TargetCounts - currentCounts;
+  float absError = fabs(error);
 
-  if (motor1AbsErrorCounts <= MOTOR1_ENCODER_TOLERANCE_COUNTS) {
-    brakeMotor1();
-    motor1IntegralError = 0.0;
-    motor1PreviousError = motor1ErrorCounts;
+  if (absError <= M1_COUNT_TOLERANCE) {
+    brakeM1();
+    m1ErrorSum = 0.0;
+    m1LastError = error;
     return;
   }
 
-  float motor1ErrorDerivative = (motor1ErrorCounts - motor1PreviousError) / dt;
+  float errorChange = (error - m1LastError) / dt;
 
-  motor1IntegralError = motor1IntegralError + motor1ErrorCounts * dt;
+  m1ErrorSum += error * dt;
 
-  if (motor1IntegralError > 300) {
-    motor1IntegralError = 300;
+  if (m1ErrorSum > 300) {
+    m1ErrorSum = 300;
   }
 
-  if (motor1IntegralError < -300) {
-    motor1IntegralError = -300;
+  if (m1ErrorSum < -300) {
+    m1ErrorSum = -300;
   }
 
-  float motor1ControlOutput = motor1Kp * motor1ErrorCounts
-                            + motor1Kd * motor1ErrorDerivative
-                            + motor1Ki * motor1IntegralError;
+  float output = m1Kp * error
+               + m1Kd * errorChange
+               + m1Ki * m1ErrorSum;
 
-  int pwmValue = abs((int)motor1ControlOutput);
+  int pwmValue = abs((int)output);
 
-  if (pwmValue > motor1ActiveMaxPwm) {
-    pwmValue = motor1ActiveMaxPwm;
+  if (pwmValue > m1MaxPwm) {
+    pwmValue = m1MaxPwm;
   }
 
   if (pwmValue > 0 && pwmValue < MIN_PWM) {
     pwmValue = MIN_PWM;
   }
 
-  int motorDirection = MOTOR_FORWARD;
+  int direction = FORWARD;
 
-  if (motor1ControlOutput < 0) {
-    motorDirection = MOTOR_REVERSE;
+  if (output < 0) {
+    direction = REVERSE;
   }
 
-  motorDirection = motorDirection * MOTOR1_OUTPUT_DIRECTION_SIGN;
+  direction *= M1_MOTOR_SIGN;
 
-  driveMotor1(motorDirection, pwmValue);
+  runM1(direction, pwmValue);
 
-  motor1PreviousError = motor1ErrorCounts;
+  m1LastError = error;
 }
 
-void updateMotor2ImuPitchPid(float dt) {
-  if (!isImuConnected) {
-    brakeMotor2();
+void updateM2Pid(float dt) {
+  if (!imuReady) {
+    brakeM2();
     return;
   }
 
-  float pitchErrorDeg = motor2TargetPitchDeg - correctedPitchDeg;
-  float absPitchErrorDeg = fabs(pitchErrorDeg);
+  float error = targetPitch - currentPitch;
+  float absError = fabs(error);
 
-  // Motor 2 stops based on IMU angle, not encoder counts.
-  if (absPitchErrorDeg <= MOTOR2_PITCH_TOLERANCE_DEG) {
-    brakeMotor2();
-    motor2IntegralPitchError = 0.0;
-    motor2PreviousPitchError = pitchErrorDeg;
+  if (absError <= M2_PITCH_TOLERANCE) {
+    brakeM2();
+    pitchErrorSum = 0.0;
+    lastPitchError = error;
     return;
   }
 
-  float pitchErrorDerivative = (pitchErrorDeg - motor2PreviousPitchError) / dt;
+  float errorChange = (error - lastPitchError) / dt;
 
-  motor2IntegralPitchError = motor2IntegralPitchError + pitchErrorDeg * dt;
+  pitchErrorSum += error * dt;
 
-  if (motor2IntegralPitchError > 100) {
-    motor2IntegralPitchError = 100;
+  if (pitchErrorSum > 100) {
+    pitchErrorSum = 100;
   }
 
-  if (motor2IntegralPitchError < -100) {
-    motor2IntegralPitchError = -100;
+  if (pitchErrorSum < -100) {
+    pitchErrorSum = -100;
   }
 
-  float motor2ControlOutput = motor2PitchKp * pitchErrorDeg
-                            + motor2PitchKd * pitchErrorDerivative
-                            + motor2PitchKi * motor2IntegralPitchError;
+  float output = m2Kp * error
+               + m2Kd * errorChange
+               + m2Ki * pitchErrorSum;
 
-  int pwmValue = abs((int)motor2ControlOutput);
+  int pwmValue = abs((int)output);
 
-  int pwmLimit = motor2ActiveMaxPwm;
+  int pwmLimit = m2MaxPwm;
 
-  // Slow down close to target
-  if (absPitchErrorDeg <= MOTOR2_PITCH_SLOW_ZONE_DEG) {
-    pwmLimit = MOTOR2_SLOW_PWM;
+  if (absError <= M2_SLOW_ZONE) {
+    pwmLimit = M2_SLOW_PWM;
   }
 
   if (pwmValue > pwmLimit) {
@@ -529,131 +482,147 @@ void updateMotor2ImuPitchPid(float dt) {
     pwmValue = MIN_PWM;
   }
 
-  int motorDirection = MOTOR_FORWARD;
+  int direction = FORWARD;
 
-  if (motor2ControlOutput < 0) {
-    motorDirection = MOTOR_REVERSE;
+  if (output < 0) {
+    direction = REVERSE;
   }
 
-  motorDirection = motorDirection * MOTOR2_IMU_OUTPUT_DIRECTION_SIGN;
+  direction *= M2_MOTOR_SIGN;
 
-  driveMotor2(motorDirection, pwmValue);
+  runM2(direction, pwmValue);
 
-  motor2PreviousPitchError = pitchErrorDeg;
+  lastPitchError = error;
 }
 
 
-// Target checks
+// TARGET CHECKS
 
-bool isMotor1EncoderTargetReached() {
-  long motor1ErrorCounts = motor1TargetEncoderCounts - getMotor1EncoderCounts();
 
-  return labs(motor1ErrorCounts) <= MOTOR1_ENCODER_TOLERANCE_COUNTS;
+bool m1AtTarget() {
+  long error = m1TargetCounts - readM1Counts();
+
+  return labs(error) <= M1_COUNT_TOLERANCE;
 }
 
-bool isMotor2PitchTargetReached() {
-  updateImuAngles();
+bool m2AtTarget() {
+  readPitch();
 
-  float pitchErrorDeg = motor2TargetPitchDeg - correctedPitchDeg;
+  float error = targetPitch - currentPitch;
 
-  return fabs(pitchErrorDeg) <= MOTOR2_PITCH_TOLERANCE_DEG;
-}
-
-// Conversion functions
-
-
-long motorDegreesToEncoderCounts(float degrees) {
-  return (long)((degrees / 360.0) * OUTPUT_COUNTS_PER_REV);
-}
-
-float encoderCountsToMotorDegrees(long counts) {
-  return ((float)counts / OUTPUT_COUNTS_PER_REV) * 360.0;
+  return fabs(error) <= M2_PITCH_TOLERANCE;
 }
 
 
-// Encoder functions using Paul Stoffregen Encoder library
+// ENCODER FUNCTIONS
 
-long getMotor1EncoderCounts() {
-  return motor1Encoder.read() * MOTOR1_ENCODER_DIRECTION_SIGN;
+
+long readM1Counts() {
+  return enc1.read() * M1_ENC_SIGN;
 }
 
-long getMotor2EncoderCounts() {
-  return motor2Encoder.read() * MOTOR2_ENCODER_DIRECTION_SIGN;
+long readM2Counts() {
+  return enc2.read() * M2_ENC_SIGN;
 }
 
+long degreesToCounts(float degrees) {
+  return (long)((degrees / 360.0) * COUNTS_PER_OUTPUT_REV);
+}
 
-// Motor control functions
+float countsToDegrees(long counts) {
+  return ((float)counts / COUNTS_PER_OUTPUT_REV) * 360.0;
+}
+
+// MOTOR DRIVER FUNCTIONS
 
 
-void driveMotor1(int direction, int pwmValue) {
+void runM1(int direction, int pwmValue) {
   pwmValue = constrain(pwmValue, 0, 255);
 
-  if (direction == MOTOR_FORWARD) {
-    analogWrite(MOTOR1_IN1, pwmValue);
-    analogWrite(MOTOR1_IN2, 0);
+  if (direction == FORWARD) {
+    analogWrite(M1_IN1, pwmValue);
+    analogWrite(M1_IN2, 0);
   } 
-  else if (direction == MOTOR_REVERSE) {
-    analogWrite(MOTOR1_IN1, 0);
-    analogWrite(MOTOR1_IN2, pwmValue);
+  else if (direction == REVERSE) {
+    analogWrite(M1_IN1, 0);
+    analogWrite(M1_IN2, pwmValue);
   } 
   else {
-    stopMotor1();
+    stopM1();
   }
 }
 
-void driveMotor2(int direction, int pwmValue) {
+void runM2(int direction, int pwmValue) {
   pwmValue = constrain(pwmValue, 0, 255);
 
-  if (direction == MOTOR_FORWARD) {
-    analogWrite(MOTOR2_IN1, pwmValue);
-    analogWrite(MOTOR2_IN2, 0);
+  if (direction == FORWARD) {
+    analogWrite(M2_IN1, pwmValue);
+    analogWrite(M2_IN2, 0);
   } 
-  else if (direction == MOTOR_REVERSE) {
-    analogWrite(MOTOR2_IN1, 0);
-    analogWrite(MOTOR2_IN2, pwmValue);
+  else if (direction == REVERSE) {
+    analogWrite(M2_IN1, 0);
+    analogWrite(M2_IN2, pwmValue);
   } 
   else {
-    stopMotor2();
+    stopM2();
   }
 }
 
-void stopMotor1() {
-  analogWrite(MOTOR1_IN1, 0);
-  analogWrite(MOTOR1_IN2, 0);
+void stopM1() {
+  analogWrite(M1_IN1, 0);
+  analogWrite(M1_IN2, 0);
 }
 
-void stopMotor2() {
-  analogWrite(MOTOR2_IN1, 0);
-  analogWrite(MOTOR2_IN2, 0);
+void stopM2() {
+  analogWrite(M2_IN1, 0);
+  analogWrite(M2_IN2, 0);
 }
 
-void brakeMotor1() {
-  analogWrite(MOTOR1_IN1, 255);
-  analogWrite(MOTOR1_IN2, 255);
+void brakeM1() {
+  analogWrite(M1_IN1, 255);
+  analogWrite(M1_IN2, 255);
 }
 
-void brakeMotor2() {
-  analogWrite(MOTOR2_IN1, 255);
-  analogWrite(MOTOR2_IN2, 255);
+void brakeM2() {
+  analogWrite(M2_IN1, 255);
+  analogWrite(M2_IN2, 255);
 }
-// Serial output
-void printTelemetry() {
-  if (millis() - lastTelemetryPrintMillis >= TELEMETRY_PRINT_INTERVAL_MS) {
-    lastTelemetryPrintMillis = millis();
 
-    long motor2CurrentCounts = getMotor2EncoderCounts();
-    float pitchErrorDeg = motor2TargetPitchDeg - correctedPitchDeg;
+// SERIAL INPUT / OUTPUT
 
-    Serial.print("TargetDeg:");
-    Serial.print(motor2TargetPitchDeg, 2);
 
-    Serial.print(" |Current Deg: ");
-    Serial.print(correctedPitchDeg, 2);
+void checkSerial() {
+  if (Serial.available() > 0) {
+    char command = Serial.read();
 
-    Serial.print(" |DegreeError: ");
-    Serial.print(pitchErrorDeg, 2);
-    
-    Serial.print(" |M2EncoderCounts: ");
-    Serial.println(motor2CurrentCounts);
+    if (command == 'r' || command == 'R') {
+      zeroImu();
+    }
+  }
+}
+
+void printData() {
+  if (millis() - lastPrintTime >= PRINT_TIME_MS) {
+    lastPrintTime = millis();
+
+    float error = targetPitch - currentPitch;
+
+    Serial.print("TargetDeg: ");
+    Serial.print(targetPitch, 2);
+
+    Serial.print(" | CurrentDeg: ");
+    Serial.print(currentPitch, 2);
+
+    Serial.print(" | ErrorDeg: ");
+    Serial.print(error, 2);
+
+    Serial.print(" | RawPitch: ");
+    Serial.print(rawPitch, 2);
+
+    Serial.print(" | M1Counts: ");
+    Serial.print(readM1Counts());
+
+    Serial.print(" | M2Counts: ");
+    Serial.println(readM2Counts());
   }
 }
