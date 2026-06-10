@@ -48,6 +48,8 @@ const float COUNTS_PER_OUTPUT_REV = ENCODER_COUNTS_PER_MOTOR_REV * GEAR_RATIO; /
 const float COUNTS_PER_DEGREE = COUNTS_PER_OUTPUT_REV / 360.0;                 // 48
 const float EXPECTED_COUNTS_90_DEG = COUNTS_PER_DEGREE * 90.0;                 // 4320
 
+
+
 // ----------------------
 // Trial settings
 // ----------------------
