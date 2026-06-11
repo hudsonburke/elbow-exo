@@ -8,8 +8,9 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
+// 
 // IMU
-
+// 
 
 // Do not name this "imu" because the Adafruit library already has a namespace called imu.
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
@@ -24,9 +25,9 @@ float currentPitch = 0.0;
 // If your IMU reads +90 as +90, change this to 1.
 const int PITCH_SIGN = -1;
 
-
+// 
 // MOTOR PINS
-
+// 
 
 // Motor 1
 #define M1_IN1 5
@@ -44,9 +45,9 @@ const int PITCH_SIGN = -1;
 Encoder enc1(M1_ENC_A, M1_ENC_B);
 Encoder enc2(M2_ENC_A, M2_ENC_B);
 
-
+// 
 // DIRECTION SETTINGS
-
+// 
 
 const int FORWARD = 1;
 const int REVERSE = -1;
@@ -59,17 +60,17 @@ const int M2_ENC_SIGN = 1;
 const int M1_MOTOR_SIGN = 1;
 const int M2_MOTOR_SIGN = 1;
 
-
+// 
 // ENCODER / GEARBOX SETTINGS
-
+// 
 
 const int COUNTS_PER_MOTOR_REV = 64;
 const int GEAR_RATIO = 270;
 const int COUNTS_PER_OUTPUT_REV = COUNTS_PER_MOTOR_REV * GEAR_RATIO;
 
-
+// 
 // PID VALUES
-
+// 
 
 // Motor 1 uses encoder PID.
 float m1Kp = 0.12;
@@ -81,9 +82,9 @@ float m2Kp = 4.0;
 float m2Kd = 0.15;
 float m2Ki = 0.0;
 
-
+// 
 // MOTOR LIMITS
-
+// 
 
 const int MIN_PWM = 125;
 const int MAX_PWM = 255;
@@ -100,9 +101,9 @@ const int M2_SLOW_PWM = 150;
 // Safety timeout so Motor 2 does not run forever if something is wrong.
 const unsigned long M2_MOVE_TIMEOUT_MS = 12000;
 
-
+// 
 // TIME SETTINGS
-
+// 
 
 const unsigned long CONTROL_TIME_US = 10000; // 10 ms
 const unsigned long PRINT_TIME_MS = 250;
@@ -110,9 +111,9 @@ const unsigned long PRINT_TIME_MS = 250;
 unsigned long lastControlTime = 0;
 unsigned long lastPrintTime = 0;
 
-
+// 
 // SERIAL CONTROL SETTINGS
-
+// 
 
 // Number key preset targets for Motor 2.
 // 0 -> 0 deg, 1 -> 10 deg, ..., 9 -> 90 deg
@@ -121,37 +122,40 @@ const float KEY_TARGETS[10] = {
   50.0, 60.0, 70.0, 80.0, 90.0
 };
 
-
+// 
 // MOTOR 1 CONTROL VARIABLES
-
+// 
 
 long m1TargetCounts = 0;
 float m1LastError = 0.0;
 float m1ErrorSum = 0.0;
 int m1MaxPwm = 220;
 
-
+// 
 // MOTOR 2 CONTROL VARIABLES
-
+// 
 
 float targetPitch = 0.0;
 float lastPitchError = 0.0;
 float pitchErrorSum = 0.0;
 int m2MaxPwm = 180;
 
-// This is the important new variable.
 // Motor 2 only runs PID when this is true.
 bool m2Moving = false;
 
 unsigned long m2MoveStartTime = 0;
 
+// 
 // FUNCTION DECLARATIONS
-
+// 
 
 void startImu();
 void zeroImu();
 void readPitch();
 float angleDiff(float currentAngle, float zeroAngle);
+
+void waitForRecalibration();
+void printMenu();
 
 void moveM1Degrees(float degrees, int direction, int maxPwm);
 void moveM2ToPitch(float newTargetPitch, int maxPwm);
@@ -183,16 +187,15 @@ void brakeM2();
 
 void checkSerial();
 void handleKeyCommand(char command);
-void printMenu();
 void printData();
 
+// 
 // SETUP
+//    
 
 void setup() {
   Serial.begin(9600);
   delay(2000);
-
-  startImu();
 
   pinMode(M1_IN1, OUTPUT);
   pinMode(M1_IN2, OUTPUT);
@@ -205,10 +208,9 @@ void setup() {
   enc1.write(0);
   enc2.write(0);
 
-  m1TargetCounts = readM1Counts();
+  startImu();
 
-  readPitch();
-  targetPitch = currentPitch;
+  m1TargetCounts = readM1Counts();
 
   m2Moving = false;
 
@@ -218,21 +220,29 @@ void setup() {
   Serial.println("System ready.");
   Serial.println("Place the mechanism at the zero position.");
   Serial.println("Type r and press Enter to recalibrate the IMU.");
-  Serial.println("After recalibrating, type a number and press Enter to move Motor 2.");
+  Serial.println();
+
+  waitForRecalibration();
+
+  readPitch();
+  targetPitch = currentPitch;
 
   printMenu();
+
+  lastControlTime = micros();
 }
 
-
+// 
 // LOOP
-
+// 
 
 void loop() {
   updateMotors();
 }
 
-
+// 
 // IMU FUNCTIONS
+// 
 
 void startImu() {
   Serial.println("Starting BNO055 IMU...");
@@ -252,10 +262,6 @@ void startImu() {
   Serial.println("BNO055 detected!");
 
   delay(500);
-
-  // Initial zero so the code has a safe starting reference.
-  // You can still press r after this to recalibrate manually.
-  zeroImu();
 }
 
 void zeroImu() {
@@ -312,8 +318,56 @@ float angleDiff(float currentAngle, float zeroAngle) {
   return difference;
 }
 
-// MOTION COMMANDS
+// 
+// STARTUP MENU
+// 
 
+void waitForRecalibration() {
+  bool recalibrated = false;
+
+  while (!recalibrated) {
+    if (Serial.available() > 0) {
+      char command = Serial.read();
+
+      if (command == '\n' || command == '\r') {
+        continue;
+      }
+
+      if (command == 'r' || command == 'R') {
+        zeroImu();
+        Serial.println("Calibration complete.");
+        Serial.println();
+        recalibrated = true;
+      } 
+      else {
+        Serial.println("Please type r and press Enter to recalibrate first.");
+      }
+    }
+  }
+}
+
+void printMenu() {
+  Serial.println("Serial control mode is ON.");
+  Serial.println("Type a number and press Enter to move Motor 2:");
+  Serial.println("0 = 0 deg");
+  Serial.println("1 = 10 deg");
+  Serial.println("2 = 20 deg");
+  Serial.println("3 = 30 deg");
+  Serial.println("4 = 40 deg");
+  Serial.println("5 = 50 deg");
+  Serial.println("6 = 60 deg");
+  Serial.println("7 = 70 deg");
+  Serial.println("8 = 80 deg");
+  Serial.println("9 = 90 deg");
+  Serial.println("s = stop Motor 2");
+  Serial.println("r = recalibrate IMU to 0");
+  Serial.println("m = print this menu again");
+  Serial.println();
+}
+
+// 
+// MOTION COMMANDS
+// 
 
 void moveM1Degrees(float degrees, int direction, int maxPwm) {
   setM1Target(degrees, direction, maxPwm);
@@ -387,12 +441,14 @@ void setM2Target(float newTargetPitch, int maxPwm) {
   Serial.print(targetPitch, 2);
   Serial.println(" degrees.");
 
-  Serial.println("TargetDeg | CurrentDeg | ErrorDeg | RawPitch | M2Counts");
+  Serial.println("Teleplot is plotting targetDeg and currentDeg.");
+  Serial.println("Readable data will also print below:");
+  Serial.println();
 }
 
-
+// 
 // PID CONTROL
-
+// 
 
 void updateMotors() {
   checkSerial();
@@ -418,7 +474,7 @@ void updateMotors() {
   // Motor 2 only runs when m2Moving is true.
   updateM2Pid(dt);
 
-  // Only print position updates while Motor 2 is moving.
+  // Only print Teleplot/readable values while Motor 2 is moving.
   if (m2Moving) {
     printData();
   }
@@ -489,7 +545,7 @@ void updateM2Pid(float dt) {
     return;
   }
 
-  // Safety timeout
+  // Safety timeout.
   if (millis() - m2MoveStartTime > M2_MOVE_TIMEOUT_MS) {
     brakeM2();
     m2Moving = false;
@@ -527,6 +583,10 @@ void updateM2Pid(float dt) {
     Serial.print(currentPitch, 2);
     Serial.print(" | ErrorDeg: ");
     Serial.print(error, 2);
+    Serial.print(" | RawPitch: ");
+    Serial.print(rawPitch, 2);
+    Serial.print(" | M1Counts: ");
+    Serial.print(readM1Counts());
     Serial.print(" | M2Counts: ");
     Serial.println(readM2Counts());
     Serial.println("Choose another target.");
@@ -580,8 +640,9 @@ void updateM2Pid(float dt) {
   lastPitchError = error;
 }
 
+// 
 // TARGET CHECKS
-
+// 
 
 bool m1AtTarget() {
   long error = m1TargetCounts - readM1Counts();
@@ -597,9 +658,9 @@ bool m2AtTarget() {
   return fabs(error) <= M2_PITCH_TOLERANCE;
 }
 
-
+// 
 // ENCODER FUNCTIONS
-
+// 
 
 long readM1Counts() {
   return enc1.read() * M1_ENC_SIGN;
@@ -617,9 +678,9 @@ float countsToDegrees(long counts) {
   return ((float)counts / COUNTS_PER_OUTPUT_REV) * 360.0;
 }
 
-
+// 
 // MOTOR DRIVER FUNCTIONS
-
+// 
 
 void runM1(int direction, int pwmValue) {
   pwmValue = constrain(pwmValue, 0, 255);
@@ -673,9 +734,9 @@ void brakeM2() {
   analogWrite(M2_IN2, 255);
 }
 
-
+// 
 // SERIAL INPUT / OUTPUT
-
+// 
 
 void checkSerial() {
   while (Serial.available() > 0) {
@@ -710,7 +771,6 @@ void handleKeyCommand(char command) {
   if (command == 's' || command == 'S') {
     readPitch();
 
-    // Stop moving and hold the current angle.
     targetPitch = currentPitch;
     pitchErrorSum = 0.0;
     lastPitchError = 0.0;
@@ -736,31 +796,24 @@ void handleKeyCommand(char command) {
   Serial.println(command);
 }
 
-void printMenu() {
-  Serial.println();
-  Serial.println("Serial control mode is ON.");
-  Serial.println("Type a number and press Enter to move Motor 2:");
-  Serial.println("0 = 0 deg");
-  Serial.println("1 = 10 deg");
-  Serial.println("2 = 20 deg");
-  Serial.println("3 = 30 deg");
-  Serial.println("4 = 40 deg");
-  Serial.println("5 = 50 deg");
-  Serial.println("6 = 60 deg");
-  Serial.println("7 = 70 deg");
-  Serial.println("8 = 80 deg");
-  Serial.println("9 = 90 deg");
-  Serial.println("s = stop Motor 2");
-  Serial.println("r = recalibrate IMU to 0");
-  Serial.println("m = print this menu again");
-  Serial.println();
-}
-
 void printData() {
   if (millis() - lastPrintTime >= PRINT_TIME_MS) {
     lastPrintTime = millis();
 
     float error = targetPitch - currentPitch;
+
+  
+    // Teleplot output
+    // Only these two values are plotted.
+    
+    Serial.print(">targetDeg:");
+    Serial.println(targetPitch, 2);
+
+    Serial.print(">currentDeg:");
+    Serial.println(currentPitch, 2);
+
+    // 
+    // Normal readable terminal output
 
     Serial.print("TargetDeg: ");
     Serial.print(targetPitch, 2);
@@ -773,6 +826,8 @@ void printData() {
 
     Serial.print(" | RawPitch: ");
     Serial.print(rawPitch, 2);
+
+   
 
     Serial.print(" | M2Counts: ");
     Serial.println(readM2Counts());
