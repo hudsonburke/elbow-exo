@@ -11,8 +11,6 @@
 
 // IMU
 
-
-// Do not name this "imu" because the Adafruit library already has a namespace called imu.
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
 bool imuReady = false;
@@ -30,16 +28,16 @@ const int PITCH_SIGN = -1;
 
 
 // Motor 1
-#define M1_IN1 5
-#define M1_IN2 6
-#define M1_ENC_A 2
-#define M1_ENC_B 4
+#define M1_IN1 4
+#define M1_IN2 5
+#define M1_ENC_A 30
+#define M1_ENC_B 31
 
 // Motor 2
-#define M2_IN1 9
-#define M2_IN2 10
-#define M2_ENC_A 3
-#define M2_ENC_B 7
+#define M2_IN1 2
+#define M2_IN2 3
+#define M2_ENC_A 28
+#define M2_ENC_B 29
 
 // Encoder objects
 Encoder enc1(M1_ENC_A, M1_ENC_B);
@@ -47,7 +45,7 @@ Encoder enc2(M2_ENC_A, M2_ENC_B);
 
  
 // DIRECTION SETTINGS
-
+ 
 
 const int FORWARD = 1;
 const int REVERSE = -1;
