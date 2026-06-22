@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 """
-Quaternion-only 3D arm visualizer for the Arduino BNO055 output.
 
-Install:
-    python -m pip install pyserial matplotlib numpy
-
-Run:
-    python arm_visualizer_quaternion_only.py
-
-Important:
-- Close PlatformIO Serial Monitor before running this.
-- Only one program can use the COM port at a time.
 - Press Z in the plot window to send "zero" to Arduino.
 - Press R to reset the Python-side visualization memory.
 - Press Q to quit.
 
-This version uses quaternion values for the arm geometry.
-Euler values are parsed only for human-readable status text.
+
 """
 
 import re
@@ -143,6 +132,8 @@ def quat_angle_deg(q):
 # Serial functions
 # =====================
 
+# Open the serial port that communicates with the Arduino.
+# If the port cannot be opened, this returns None.
 def open_serial(port, baud):
     try:
         ser = serial.Serial(port, baud, timeout=0.1)
@@ -153,6 +144,7 @@ def open_serial(port, baud):
         return None
 
 
+# Send a text command to the Arduino. This is used by the key handler.
 def send_command(command):
     global ser_global
 
@@ -167,6 +159,8 @@ def send_command(command):
         print(f"Failed to send command: {e}")
 
 
+# Read lines from serial in a separate thread so the plot stays responsive.
+# Each received line is stored in `line_queue` for later parsing.
 def serial_reader_thread(ser):
     try:
         while not stop_event.is_set():
@@ -194,6 +188,12 @@ def serial_reader_thread(ser):
 # =====================
 
 def parse_line(line):
+    """Read one serial line and classify it by type.
+
+    The Arduino output includes sections for IMU orientation and joint
+    relative rotation. This function finds the line type and returns a
+    simplified structure for later processing.
+    """
     imu_match = IMU_HEADER_RE.search(line)
     if imu_match:
         return "imu_header", {"imu_id": int(imu_match.group(1))}
@@ -243,19 +243,24 @@ def update_latest_data():
         line_type, data = result
 
         if line_type == "imu_header":
+            # Start reading a new IMU block.
             parse_state["current_imu"] = data["imu_id"]
             parse_state["current_joint"] = None
             parse_state["pending_quat"] = None
 
         elif line_type == "joint_header":
+            # Start reading a new joint block.
             parse_state["current_joint"] = (data["child"], data["parent"])
             parse_state["current_imu"] = None
             parse_state["pending_quat"] = None
 
         elif line_type == "quaternion":
+            # Store the quaternion until we get the matching Euler line.
             parse_state["pending_quat"] = normalize_quat(data["quat"])
 
         elif line_type == "euler":
+            # Once we have both quaternion and Euler for the same block,
+            # store them together for display or kinematics.
             q = parse_state["pending_quat"]
             if q is None:
                 continue
@@ -267,8 +272,7 @@ def update_latest_data():
 
             elif parse_state["current_joint"] is not None:
                 child, parent = parse_state["current_joint"]
-                # Store Joint child-parent using the parent index.
-                # Example: Joint 1-0 is the elbow joint after IMU 0.
+                # Use the parent IMU index as the joint key.
                 key = str(parent)
                 latest_joint_quats[key] = q
                 latest_joint_eulers[key] = data["euler"]
@@ -278,6 +282,7 @@ def update_latest_data():
             parse_state["current_joint"] = None
 
         elif line_type == "separator":
+            # Reset parsing state at the end of an output block.
             parse_state["current_imu"] = None
             parse_state["current_joint"] = None
             parse_state["pending_quat"] = None
@@ -288,18 +293,12 @@ def update_latest_data():
 # =====================
 
 def build_arm_positions():
-    """
-    Build 3D arm positions using quaternions only.
-
-    Preferred path:
-    - Upper arm direction = IMU 0 absolute quaternion rotating SEGMENT_AXIS_LOCAL.
-    - Forearm direction = IMU 1 absolute quaternion rotating SEGMENT_AXIS_LOCAL.
-
-    Fallback:
-    - If IMU 1 is unavailable but Joint 1-0 is available, rotate the upper-arm
-      direction by the Joint 1-0 relative quaternion.
-    """
+    """Build the arm joint positions from the latest quaternion data."""
+    # The shoulder is fixed at the origin for this visualization.
     shoulder = np.array([0.0, 0.0, 0.0])
+
+    # The local segment axis is the direction of the arm segment in the IMU's
+    # own coordinate frame before any rotation is applied.
     base_axis = SEGMENT_AXIS_LOCAL / np.linalg.norm(SEGMENT_AXIS_LOCAL)
 
     q0 = latest_imu_quats.get("0")
@@ -307,21 +306,26 @@ def build_arm_positions():
     q_joint_0 = latest_joint_quats.get("0")
 
     if q0 is not None:
+        # Rotate the base axis by IMU 0 to get the upper-arm direction.
         upper_dir = rotate_vector_by_quat(base_axis, q0)
     else:
         upper_dir = base_axis.copy()
 
     if q1 is not None:
+        # Use IMU 1 absolute orientation for the forearm direction.
         forearm_dir = rotate_vector_by_quat(base_axis * FOREARM_DIRECTION_SIGN, q1)
     elif q_joint_0 is not None:
+        # Fallback: use the relative joint quaternion if IMU 1 is not available.
         forearm_dir = rotate_vector_by_quat(upper_dir * FOREARM_DIRECTION_SIGN, q_joint_0)
     else:
+        # If no quaternion data exists, point the forearm in the same plane.
         forearm_dir = upper_dir.copy() * FOREARM_DIRECTION_SIGN
 
-    # Normalize directions to prevent tiny numerical scaling drift.
+    # Normalize the direction vectors so the visual lengths are stable.
     upper_dir = upper_dir / np.linalg.norm(upper_dir)
     forearm_dir = forearm_dir / np.linalg.norm(forearm_dir)
 
+    # Calculate world positions for the elbow and wrist.
     elbow = shoulder + UPPER_ARM_LENGTH * upper_dir
     wrist = elbow + FOREARM_LENGTH * forearm_dir
 
@@ -335,15 +339,19 @@ def build_arm_positions():
 # =====================
 
 def main():
+    """Start the Python visualizer and run the animation loop."""
     global ser_global, latest_imu_quats, latest_joint_quats, latest_imu_eulers, latest_joint_eulers
 
+    # Open the serial connection first.
     ser_global = open_serial(SERIAL_PORT, BAUD_RATE)
     if ser_global is None:
         return
 
+    # Read serial lines in a background thread so matplotlib stays responsive.
     t = threading.Thread(target=serial_reader_thread, args=(ser_global,), daemon=True)
     t.start()
 
+    # Create a 3D matplotlib figure for the arm.
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
 
@@ -357,36 +365,44 @@ def main():
     ax.set_zlabel("Z")
     ax.set_title("Quaternion-Only 3D Arm Visualizer | Z=zero, R=reset, Q=quit")
 
+    # Plot objects for the joints and bones.
     shoulder_dot, = ax.plot([], [], [], "ko", markersize=6)
     elbow_dot, = ax.plot([], [], [], "ro", markersize=6)
     wrist_dot, = ax.plot([], [], [], "bo", markersize=6)
     upper_line, = ax.plot([], [], [], "r-", linewidth=3)
     fore_line, = ax.plot([], [], [], "b-", linewidth=3)
 
-    text = ax.text2D(0.02, 0.95, "", transform=ax.transAxes, verticalalignment="top")
+    # Place the status text below the 3D axes to avoid overlapping with the visualization.
+    text = fig.text(0.02, 0.01, "", transform=fig.transFigure, verticalalignment="bottom", fontsize=9)
 
     def on_key(event):
+        """Handle keyboard controls from the plot window."""
         global latest_imu_quats, latest_joint_quats, latest_imu_eulers, latest_joint_eulers
 
         if event.key == "z":
-            send_command("zero")
+            # Send a zero command to the Arduino so it captures a reference orientation.
+            send_command("z")
         elif event.key == "r":
+            # Clear all stored data in Python.
             latest_imu_quats = {}
             latest_joint_quats = {}
             latest_imu_eulers = {}
             latest_joint_eulers = {}
             print("Reset Python-side visualizer state.")
         elif event.key == "q":
+            # Quit the visualizer cleanly.
             stop_event.set()
             plt.close(fig)
 
     fig.canvas.mpl_connect("key_press_event", on_key)
 
     def update(frame):
+        """Update the arm pose and status text every animation frame."""
         update_latest_data()
 
         shoulder, elbow, wrist, elbow_angle = build_arm_positions()
 
+        # Update the joint marker positions.
         shoulder_dot.set_data([shoulder[0]], [shoulder[1]])
         shoulder_dot.set_3d_properties([shoulder[2]])
         elbow_dot.set_data([elbow[0]], [elbow[1]])
@@ -394,22 +410,29 @@ def main():
         wrist_dot.set_data([wrist[0]], [wrist[1]])
         wrist_dot.set_3d_properties([wrist[2]])
 
+        # Update the bone line segments.
         upper_line.set_data([shoulder[0], elbow[0]], [shoulder[1], elbow[1]])
         upper_line.set_3d_properties([shoulder[2], elbow[2]])
         fore_line.set_data([elbow[0], wrist[0]], [elbow[1], wrist[1]])
         fore_line.set_3d_properties([elbow[2], wrist[2]])
 
         imu0_euler = latest_imu_eulers.get("0")
+        imu1_euler = latest_imu_eulers.get("1")
         joint0_euler = latest_joint_eulers.get("0")
 
-        status_text = "Kinematics: quaternion only\n"
-        status_text += f"IMU quats: {len(latest_imu_quats)}\n"
+        # Build status text shown in the figure.
+      
+        status_text = f"IMU quats: {len(latest_imu_quats)}\n"
         status_text += f"Joint quats: {len(latest_joint_quats)}\n"
         status_text += f"Elbow quat angle: {elbow_angle:.1f}\n"
 
         if imu0_euler is not None:
             h, r, p = imu0_euler
             status_text += f"\nIMU 0 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"
+        if imu1_euler is not None:
+            h, r, p = imu1_euler
+            status_text += f"\nIMU 1 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"
+        
         if joint0_euler is not None:
             h, r, p = joint0_euler
             status_text += f"\nJoint 1-0 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"

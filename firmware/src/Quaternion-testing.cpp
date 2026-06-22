@@ -211,7 +211,7 @@ void processSerialCommands() {
   line.trim();
   line.toLowerCase();
 
-  if (line == "zero") {
+  if (line == "z") {
     bool any_zeroed = false;
 
     // Save current orientation as reference for each active IMU
@@ -276,7 +276,7 @@ void setup() {
   Serial.print(PRINT_PERIOD_MS);
   Serial.println(" ms");
   Serial.println("\nCommands:");
-  Serial.println("  Type 'zero' to set reference orientation\n");
+  Serial.println("  Type 'z' to set reference orientation\n");
 }
 
 // =====================================================
