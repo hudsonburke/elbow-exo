@@ -14,9 +14,9 @@ Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
 bool imuReady = false;
 
-// IMU angle variables.
-// The original code only used pitch. This version keeps pitch, roll, and yaw
-// so you can choose which IMU axis the motors should control.
+
+// IMU ANGLE VARIABLES
+
 float pitchZero = 0.0;
 float rawPitch = 0.0;
 float currentPitch = 0.0;
@@ -29,15 +29,12 @@ float yawZero = 0.0;
 float rawYaw = 0.0;
 float currentYaw = 0.0;
 
-// These two variables are the selected axis used by the PID loops.
-// If you choose pitch, these follow pitch.
-// If you choose roll, these follow roll.
-// If you choose yaw, these follow yaw.
+// These are the values used by the PID.
+// They change based on whether you selected pitch, roll, or yaw.
 float rawControlAngle = 0.0;
 float currentControlAngle = 0.0;
 
-// If your IMU reads +90 as -90 on an axis, change that axis sign.
-// Your old pitch value used -1, so pitch remains -1.
+// If an axis reads backwards, flip that sign.
 const int PITCH_SIGN = -1;
 const int ROLL_SIGN = 1;
 const int YAW_SIGN = 1;
@@ -53,6 +50,7 @@ const char* selectedAxisName = "pitch";
 
 
 // MOTOR PINS
+
 // Motor 1
 #define M1_IN1 4
 #define M1_IN2 5
@@ -65,13 +63,11 @@ const char* selectedAxisName = "pitch";
 #define M2_ENC_A 28
 #define M2_ENC_B 29
 
-// Encoder objects
 Encoder enc1(M1_ENC_A, M1_ENC_B);
 Encoder enc2(M2_ENC_A, M2_ENC_B);
 
- 
+
 // DIRECTION SETTINGS
- 
 
 const int FORWARD = 1;
 const int REVERSE = -1;
@@ -84,16 +80,14 @@ const int M2_ENC_SIGN = 1;
 const int M1_MOTOR_SIGN = 1;
 const int M2_MOTOR_SIGN = 1;
 
-// ROLL MODE DIRECTION SETTINGS
-// In roll mode, Motor 1 creates the roll motion and Motor 2 runs opposite
-// to reverse/counter that motion. If roll correction goes the wrong way,
-// flip one of these values from 1 to -1 or -1 to 1.
+// Roll behavior:
+// Motor 1 turns the IMU.
+// Motor 2 runs opposite to reverse/counter that motion.
 const int ROLL_M1_DIRECTION_SIGN = 1;
 const int ROLL_M2_DIRECTION_SIGN = -1;
 
 
 // ENCODER / GEARBOX SETTINGS
-
 
 const int COUNTS_PER_MOTOR_REV = 64;
 const int GEAR_RATIO = 270;
@@ -101,26 +95,24 @@ const int COUNTS_PER_OUTPUT_REV = COUNTS_PER_MOTOR_REV * GEAR_RATIO;
 
 
 // PID VALUES
-// Motor 1 uses the same selected IMU-axis PID style as Motor 2.
+
+// Motor 1 selected-axis PID.
 float m1Kp = 1.75;
 float m1Kd = 0.0;
 float m1Ki = 0.125;
 
-// Motor 2 uses selected IMU-axis PID.
+// Motor 2 selected-axis PID.
 float m2Kp = 1.75;
 float m2Kd = 0.0;
 float m2Ki = 0.125;
 
-// MOTOR LIMITS
 
+// MOTOR LIMITS
 
 const int MIN_PWM = 125;
 const int MAX_PWM = 255;
 
-// Motor 1 now uses the same minimum PWM style as Motor 2.
 const int M1_MIN_PWM = 150;
-
-// Motor 2 needs stronger PWM because the mechanism has load.
 const int M2_MIN_PWM = 150;
 
 const float M1_ANGLE_TOLERANCE = 1.0;
@@ -131,15 +123,13 @@ const float M2_ANGLE_TOLERANCE = 1.0;
 const float M2_SLOW_ZONE = 5.0;
 const int M2_SLOW_PWM = 150;
 
-// Safety timeout so Motor 1 does not run forever if something is wrong.
+// Timeout only applies while trying to reach or correct the target.
+// When the motor is holding at the target, the timeout refreshes.
 const unsigned long M1_MOVE_TIMEOUT_MS = 12000;
-
-// Safety timeout so Motor 2 does not run forever if something is wrong.
 const unsigned long M2_MOVE_TIMEOUT_MS = 12000;
 
 
 // TIME SETTINGS
-
 
 const unsigned long CONTROL_TIME_US = 10000; // 10 ms
 const unsigned long PRINT_TIME_MS = 250;
@@ -150,8 +140,7 @@ unsigned long lastPrintTime = 0;
 
 // SERIAL CONTROL SETTINGS
 
-
-// Number key preset targets for both motors.
+// Number key preset targets.
 // 0 -> 0 deg, 1 -> 10 deg, ..., 9 -> 90 deg
 const float KEY_TARGETS[10] = {
   0.0, 10.0, 20.0, 30.0, 40.0,
@@ -161,17 +150,12 @@ const float KEY_TARGETS[10] = {
 
 // MOTOR 1 CONTROL VARIABLES
 
-
 float m1TargetAngle = 0.0;
 float m1LastAngleError = 0.0;
 float m1AngleErrorSum = 0.0;
-int m1MaxPwm = 180;
+int m1MaxPwm = 225;
 
-// Motor 1 only runs PID when this is true.
 bool m1Moving = false;
-
-// Motor 1 hold mode.
-// This lets PID stay active after reaching the target.
 bool m1HoldingTarget = false;
 bool m1ReachedMessagePrinted = false;
 
@@ -179,18 +163,13 @@ unsigned long m1MoveStartTime = 0;
 
 
 // MOTOR 2 CONTROL VARIABLES
- 
 
 float targetAngle = 0.0;
 float lastAngleError = 0.0;
 float angleErrorSum = 0.0;
-int m2MaxPwm = 180;
+int m2MaxPwm = 225;
 
-// Motor 2 only runs PID when this is true.
 bool m2Moving = false;
-
-// Motor 2 hold mode.
-// This lets PID stay active after reaching the target.
 bool m2HoldingTarget = false;
 bool m2ReachedMessagePrinted = false;
 
@@ -198,7 +177,6 @@ unsigned long m2MoveStartTime = 0;
 
 
 // FUNCTION DECLARATIONS
-
 
 void startImu();
 void chooseImuAxis();
@@ -208,6 +186,7 @@ void resetTargetsToCurrentAngle();
 void zeroImu();
 void readImuAngles();
 void readPitch();
+
 float angleDiff(float currentAngle, float zeroAngle);
 float controlError(float targetValue, float currentValue);
 
@@ -249,7 +228,6 @@ void printData();
 
 
 // SETUP
-   
 
 void setup() {
   Serial.begin(9600);
@@ -288,6 +266,7 @@ void setup() {
   waitForRecalibration();
 
   readPitch();
+
   m1TargetAngle = currentControlAngle;
   targetAngle = currentControlAngle;
 
@@ -299,14 +278,12 @@ void setup() {
 
 // LOOP
 
-
 void loop() {
   updateMotors();
 }
 
 
 // IMU FUNCTIONS
-
 
 void startImu() {
   Serial.println("Starting BNO055 IMU...");
@@ -351,7 +328,7 @@ void chooseImuAxis() {
         Serial.print("IMU axis selected: ");
         Serial.println(selectedAxisName);
         Serial.println();
-      } 
+      }
       else {
         Serial.println("Please choose p, y, or o first.");
       }
@@ -397,12 +374,12 @@ void resetTargetsToCurrentAngle() {
   m1Moving = false;
   m1HoldingTarget = false;
   m1ReachedMessagePrinted = false;
-  brakeM1();
+  stopM1();
 
   m2Moving = false;
   m2HoldingTarget = false;
   m2ReachedMessagePrinted = false;
-  brakeM2();
+  stopM2();
 }
 
 void zeroImu() {
@@ -413,9 +390,9 @@ void zeroImu() {
   sensors_event_t event;
   bno.getEvent(&event);
 
-  // BNO055 orientation mapping used here:
+  // BNO055 orientation mapping:
   // x = yaw / heading
-  // y = pitch, kept the same as your old code
+  // y = pitch
   // z = roll
   yawZero = event.orientation.x;
   pitchZero = event.orientation.y;
@@ -423,10 +400,13 @@ void zeroImu() {
 
   rawYaw = 0.0;
   currentYaw = 0.0;
+
   rawPitch = 0.0;
   currentPitch = 0.0;
+
   rawRoll = 0.0;
   currentRoll = 0.0;
+
   rawControlAngle = 0.0;
   currentControlAngle = 0.0;
 
@@ -445,10 +425,6 @@ void readImuAngles() {
   sensors_event_t event;
   bno.getEvent(&event);
 
-  // BNO055 orientation mapping used here:
-  // x = yaw / heading
-  // y = pitch, kept the same as your old code
-  // z = roll
   rawYaw = angleDiff(event.orientation.x, yawZero);
   rawPitch = angleDiff(event.orientation.y, pitchZero);
   rawRoll = angleDiff(event.orientation.z, rollZero);
@@ -471,8 +447,7 @@ void readImuAngles() {
   }
 }
 
-// Kept so older code can still call readPitch().
-// It now reads all IMU angles and updates the selected control angle.
+// Kept so older parts of the code can still call readPitch().
 void readPitch() {
   readImuAngles();
 }
@@ -498,7 +473,6 @@ float controlError(float targetValue, float currentValue) {
 
 // STARTUP MENU
 
-
 void waitForRecalibration() {
   bool recalibrated = false;
 
@@ -515,7 +489,7 @@ void waitForRecalibration() {
         Serial.println("Calibration complete.");
         Serial.println();
         recalibrated = true;
-      } 
+      }
       else {
         Serial.println("Please type r and press Enter to recalibrate first.");
       }
@@ -553,9 +527,6 @@ void printMenu() {
 
 // MOTION COMMANDS
 
-
-// Kept so older automatic sequences can still call moveM1Degrees().
-// Motor 1 now moves by the selected IMU angle instead of encoder counts.
 void moveM1Degrees(float degrees, int direction, int maxPwm) {
   readPitch();
 
@@ -582,8 +553,6 @@ void moveM1Degrees(float degrees, int direction, int maxPwm) {
   Serial.println(readM1Counts());
 }
 
-// Blocking Motor 1 selected-axis command.
-// This mirrors the old blocking Motor 2 command, but for Motor 1.
 void moveM1ToAngle(float newTargetAngle, int maxPwm) {
   setM1Target(newTargetAngle, maxPwm);
 
@@ -607,8 +576,6 @@ void moveM1ToAngle(float newTargetAngle, int maxPwm) {
   Serial.println(readM1Counts());
 }
 
-// Old blocking Motor 2 command.
-// Kept for future automatic sequences.
 void moveM2ToAngle(float newTargetAngle, int maxPwm) {
   setM2Target(newTargetAngle, maxPwm);
 
@@ -641,8 +608,6 @@ void holdTargets(unsigned long holdTimeMs) {
   }
 }
 
-// New non-blocking Motor 1 command.
-// This starts motion, but does not block the loop.
 void setM1Target(float newTargetAngle, int maxPwm) {
   readPitch();
 
@@ -663,13 +628,9 @@ void setM1Target(float newTargetAngle, int maxPwm) {
   Serial.print(" degrees using IMU ");
   Serial.print(selectedAxisName);
   Serial.println(".");
-
-  Serial.println("Motor 1 is using selected IMU-axis PID.");
   Serial.println();
 }
 
-// New non-blocking Motor 2 command.
-// This starts motion, but does not block the loop.
 void setM2Target(float newTargetAngle, int maxPwm) {
   readPitch();
 
@@ -690,7 +651,6 @@ void setM2Target(float newTargetAngle, int maxPwm) {
   Serial.print(" degrees using IMU ");
   Serial.print(selectedAxisName);
   Serial.println(".");
-
   Serial.println("Teleplot is plotting targetDeg and currentDeg.");
   Serial.println("Readable data will also print below:");
   Serial.println();
@@ -698,7 +658,6 @@ void setM2Target(float newTargetAngle, int maxPwm) {
 
 
 // PID CONTROL
-
 
 void updateMotors() {
   checkSerial();
@@ -718,15 +677,9 @@ void updateMotors() {
 
   readPitch();
 
-  // Motor 1 uses selected IMU-axis PID like Motor 2.
-  // After reaching the target, m1Moving stays true so PID can correct if pushed away.
   updateM1Pid(dt);
-
-  // Motor 2 PID runs when m2Moving is true.
-  // After reaching the target, m2Moving stays true so PID can correct if pushed away.
   updateM2Pid(dt);
 
-  // Print Teleplot/readable values while either IMU PID is active.
   if (m1Moving || m2Moving) {
     printData();
   }
@@ -734,34 +687,33 @@ void updateMotors() {
 
 void updateM1Pid(float dt) {
   if (!imuReady) {
-    brakeM1();
+    stopM1();
     m1Moving = false;
     m1HoldingTarget = false;
     m1ReachedMessagePrinted = false;
     return;
   }
 
-  // Pitch mode is intentionally Motor 2 only because Motor 2 pitch behavior
-  // is already working well. Motor 1 is kept stopped during pitch control.
+  // Pitch mode is intentionally Motor 2 only.
+  // Motor 2 pitch behavior is the one that already works.
   if (selectedAxis == AXIS_PITCH) {
-    brakeM1();
+    stopM1();
     m1Moving = false;
     m1HoldingTarget = false;
     m1ReachedMessagePrinted = false;
     return;
   }
 
-  // Do nothing until a number key command starts PID.
+  // No command yet: motor should be fully off.
   if (!m1Moving) {
-    brakeM1();
+    stopM1();
     return;
   }
 
   float error = controlError(m1TargetAngle, currentControlAngle);
   float absError = fabs(error);
 
-  // If Motor 1 is inside the tolerance, hold the target.
-  // Important: m1Moving stays true, so PID stays active.
+  // At target: hold/brake, but keep PID monitoring active.
   if (absError <= M1_ANGLE_TOLERANCE) {
     brakeM1();
 
@@ -770,12 +722,12 @@ void updateM1Pid(float dt) {
 
     m1HoldingTarget = true;
 
-    // Refresh timeout while holding so it does not stop after 12 seconds.
+    // Refresh timeout while holding.
     m1MoveStartTime = millis();
 
     if (!m1ReachedMessagePrinted) {
       Serial.println();
-      Serial.println("Motor 1 reached target. PID hold is still active.");
+      Serial.println("Motor 1 reached target. PID hold is active.");
       Serial.print("Axis: ");
       Serial.print(selectedAxisName);
       Serial.print(" | TargetDeg: ");
@@ -799,7 +751,7 @@ void updateM1Pid(float dt) {
     return;
   }
 
-  // If it was holding and now got pushed away, restart PID correction.
+  // If it was holding and got pushed away, restart correction.
   if (m1HoldingTarget) {
     m1HoldingTarget = false;
     m1ReachedMessagePrinted = false;
@@ -807,7 +759,6 @@ void updateM1Pid(float dt) {
     m1AngleErrorSum = 0.0;
     m1LastAngleError = error;
 
-    // Give the correction a fresh timeout window.
     m1MoveStartTime = millis();
 
     Serial.println();
@@ -815,15 +766,16 @@ void updateM1Pid(float dt) {
     Serial.println();
   }
 
-  // Safety timeout only applies while trying to reach or correct the target.
+  // Timeout: fully off, not hold/brake.
   if (millis() - m1MoveStartTime > M1_MOVE_TIMEOUT_MS) {
-    brakeM1();
+    stopM1();
+
     m1Moving = false;
     m1HoldingTarget = false;
     m1ReachedMessagePrinted = false;
 
     Serial.println();
-    Serial.println("Motor 1 move timed out. Motor stopped.");
+    Serial.println("Motor 1 move timed out. Motor is fully OFF.");
     Serial.print("Axis: ");
     Serial.print(selectedAxisName);
     Serial.print(" | TargetDeg: ");
@@ -889,24 +841,24 @@ void updateM1Pid(float dt) {
 
 void updateM2Pid(float dt) {
   if (!imuReady) {
-    brakeM2();
+    stopM2();
+
     m2Moving = false;
     m2HoldingTarget = false;
     m2ReachedMessagePrinted = false;
     return;
   }
 
-  // Do nothing until a number key command starts PID.
+  // No command yet: motor should be fully off.
   if (!m2Moving) {
-    brakeM2();
+    stopM2();
     return;
   }
 
   float error = controlError(targetAngle, currentControlAngle);
   float absError = fabs(error);
 
-  // If Motor 2 is inside the tolerance, hold the target.
-  // Important: m2Moving stays true, so PID stays active.
+  // At target: hold/brake, but keep PID monitoring active.
   if (absError <= M2_ANGLE_TOLERANCE) {
     brakeM2();
 
@@ -915,12 +867,12 @@ void updateM2Pid(float dt) {
 
     m2HoldingTarget = true;
 
-    // Refresh timeout while holding so it does not stop after 12 seconds.
+    // Refresh timeout while holding.
     m2MoveStartTime = millis();
 
     if (!m2ReachedMessagePrinted) {
       Serial.println();
-      Serial.println("Motor 2 reached target. PID hold is still active.");
+      Serial.println("Motor 2 reached target. PID hold is active.");
       Serial.print("Axis: ");
       Serial.print(selectedAxisName);
       Serial.print(" | TargetDeg: ");
@@ -944,7 +896,7 @@ void updateM2Pid(float dt) {
     return;
   }
 
-  // If it was holding and now got pushed away, restart PID correction.
+  // If it was holding and got pushed away, restart correction.
   if (m2HoldingTarget) {
     m2HoldingTarget = false;
     m2ReachedMessagePrinted = false;
@@ -952,7 +904,6 @@ void updateM2Pid(float dt) {
     angleErrorSum = 0.0;
     lastAngleError = error;
 
-    // Give the correction a fresh timeout window.
     m2MoveStartTime = millis();
 
     Serial.println();
@@ -960,15 +911,16 @@ void updateM2Pid(float dt) {
     Serial.println();
   }
 
-  // Safety timeout only applies while trying to reach or correct the target.
+  // Timeout: fully off, not hold/brake.
   if (millis() - m2MoveStartTime > M2_MOVE_TIMEOUT_MS) {
-    brakeM2();
+    stopM2();
+
     m2Moving = false;
     m2HoldingTarget = false;
     m2ReachedMessagePrinted = false;
 
     Serial.println();
-    Serial.println("Motor 2 move timed out. Motor stopped.");
+    Serial.println("Motor 2 move timed out. Motor is fully OFF.");
     Serial.print("Axis: ");
     Serial.print(selectedAxisName);
     Serial.print(" | TargetDeg: ");
@@ -1021,8 +973,7 @@ void updateM2Pid(float dt) {
     direction = REVERSE;
   }
 
-  // In roll mode, Motor 2 intentionally runs opposite Motor 1.
-  // This lets Motor 1 create the roll turn while Motor 2 reverses/counters it.
+  // In roll mode, Motor 2 runs opposite Motor 1.
   if (selectedAxis == AXIS_ROLL) {
     direction *= ROLL_M2_DIRECTION_SIGN;
   }
@@ -1036,7 +987,6 @@ void updateM2Pid(float dt) {
 
 
 // TARGET CHECKS
-
 
 bool m1AtTarget() {
   readPitch();
@@ -1057,7 +1007,6 @@ bool m2AtTarget() {
 
 // ENCODER FUNCTIONS
 
-
 long readM1Counts() {
   return enc1.read() * M1_ENC_SIGN;
 }
@@ -1077,18 +1026,17 @@ float countsToDegrees(long counts) {
 
 // MOTOR DRIVER FUNCTIONS
 
-
 void runM1(int direction, int pwmValue) {
   pwmValue = constrain(pwmValue, 0, 255);
 
   if (direction == FORWARD) {
     analogWrite(M1_IN1, pwmValue);
     analogWrite(M1_IN2, 0);
-  } 
+  }
   else if (direction == REVERSE) {
     analogWrite(M1_IN1, 0);
     analogWrite(M1_IN2, pwmValue);
-  } 
+  }
   else {
     stopM1();
   }
@@ -1100,25 +1048,44 @@ void runM2(int direction, int pwmValue) {
   if (direction == FORWARD) {
     analogWrite(M2_IN1, pwmValue);
     analogWrite(M2_IN2, 0);
-  } 
+  }
   else if (direction == REVERSE) {
     analogWrite(M2_IN1, 0);
     analogWrite(M2_IN2, pwmValue);
-  } 
+  }
   else {
     stopM2();
   }
 }
 
+
+// MOTOR OFF VS HOLD FUNCTIONS
+
+// stopM1()/stopM2()
+// Fully OFF / coast.
+// Both IN pins are LOW.
+// Used when idle, stopped by the user, recalibrated, switched axis, or timed out.
+
 void stopM1() {
   analogWrite(M1_IN1, 0);
   analogWrite(M1_IN2, 0);
+
+  digitalWrite(M1_IN1, LOW);
+  digitalWrite(M1_IN2, LOW);
 }
 
 void stopM2() {
   analogWrite(M2_IN1, 0);
   analogWrite(M2_IN2, 0);
+
+  digitalWrite(M2_IN1, LOW);
+  digitalWrite(M2_IN2, LOW);
 }
+
+// brakeM1()/brakeM2()
+// Active hold / brake.
+// Both IN pins are HIGH.
+// Used only after reaching the IMU target, so the motor holds position.
 
 void brakeM1() {
   analogWrite(M1_IN1, 255);
@@ -1133,12 +1100,10 @@ void brakeM2() {
 
 // SERIAL INPUT / OUTPUT
 
-
 void checkSerial() {
   while (Serial.available() > 0) {
     char command = Serial.read();
 
-    // Ignore line endings from Serial Monitor.
     if (command == '\n' || command == '\r') {
       continue;
     }
@@ -1153,18 +1118,22 @@ void handleKeyCommand(char command) {
     float requestedTarget = KEY_TARGETS[keyNumber];
 
     if (selectedAxis == AXIS_PITCH) {
-      // Pitch behavior: keep the working Motor 2 pitch PID behavior.
-      // Motor 1 is not used for pitch mode.
+      // Pitch behavior:
+      // Motor 2 controls pitch.
+      // Motor 1 stays fully off.
       readPitch();
+
       m1TargetAngle = currentControlAngle;
       m1AngleErrorSum = 0.0;
       m1LastAngleError = 0.0;
+
       m1Moving = false;
       m1HoldingTarget = false;
       m1ReachedMessagePrinted = false;
-      brakeM1();
 
-      setM2Target(requestedTarget, 180);
+      stopM1();
+
+      setM2Target(requestedTarget, 220);
 
       Serial.println("Pitch mode active: Motor 2 is controlling pitch. Motor 1 is stopped.");
       Serial.println();
@@ -1172,19 +1141,21 @@ void handleKeyCommand(char command) {
     }
 
     if (selectedAxis == AXIS_ROLL) {
-      // Roll behavior: both motors use the same roll target, but Motor 2 direction
-      // is reversed inside updateM2Pid() using ROLL_M2_DIRECTION_SIGN.
-      setM1Target(requestedTarget, 180);
-      setM2Target(requestedTarget, 180);
+      // Roll behavior:
+      // Both motors use the same roll target.
+      // Motor 2 direction is reversed inside updateM2Pid().
+      setM1Target(requestedTarget, 220);
+      setM2Target(requestedTarget, 220);
 
       Serial.println("Roll mode active: Motor 1 turns the IMU and Motor 2 runs opposite to reverse/counter that motion.");
       Serial.println();
       return;
     }
 
-    // Yaw behavior is left as the current shared behavior so it can be tuned later.
-    setM1Target(requestedTarget, 180);
-    setM2Target(requestedTarget, 180);
+    // Yaw behavior:
+    // Current shared behavior until you tune yaw separately.
+    setM1Target(requestedTarget, 220);
+    setM2Target(requestedTarget, 220);
 
     Serial.println("Yaw mode active: using current shared behavior for now.");
     Serial.println();
@@ -1228,7 +1199,8 @@ void handleKeyCommand(char command) {
     m1Moving = false;
     m1HoldingTarget = false;
     m1ReachedMessagePrinted = false;
-    brakeM1();
+
+    stopM1();
 
     targetAngle = currentControlAngle;
     angleErrorSum = 0.0;
@@ -1237,7 +1209,8 @@ void handleKeyCommand(char command) {
     m2Moving = false;
     m2HoldingTarget = false;
     m2ReachedMessagePrinted = false;
-    brakeM2();
+
+    stopM2();
 
     Serial.println();
     Serial.print("Motor 1 and Motor 2 stopped. Current ");
@@ -1263,51 +1236,30 @@ void printData() {
   if (millis() - lastPrintTime >= PRINT_TIME_MS) {
     lastPrintTime = millis();
 
-    float m1Error = controlError(m1TargetAngle, currentControlAngle);
-    float m2Error = controlError(targetAngle, currentControlAngle);
+    float error = controlError(targetAngle, currentControlAngle);
 
-  
     // Teleplot output
-    // These two values are plotted.
-    // In roll mode, Motor 1 and Motor 2 have the same target, but Motor 2 direction is reversed.
-    
     Serial.print(">targetDeg:");
     Serial.println(targetAngle, 2);
 
     Serial.print(">currentDeg:");
     Serial.println(currentControlAngle, 2);
 
-    // Normal readable terminal output
+    Serial.print(">errorDeg:");
+    Serial.println(error, 2);
 
+    // Readable terminal output
     Serial.print("Axis: ");
     Serial.print(selectedAxisName);
 
-    Serial.print(" | M1TargetDeg: ");
-    Serial.print(m1TargetAngle, 2);
-
-    Serial.print(" | M2TargetDeg: ");
+    Serial.print(" | TargetDeg: ");
     Serial.print(targetAngle, 2);
 
     Serial.print(" | CurrentDeg: ");
     Serial.print(currentControlAngle, 2);
 
-    Serial.print(" | M1ErrorDeg: ");
-    Serial.print(m1Error, 2);
-
-    Serial.print(" | M2ErrorDeg: ");
-    Serial.print(m2Error, 2);
-
-    Serial.print(" | RawAxis: ");
-    Serial.print(rawControlAngle, 2);
-
-    Serial.print(" | Pitch: ");
-    Serial.print(currentPitch, 2);
-
-    Serial.print(" | Roll: ");
-    Serial.print(currentRoll, 2);
-
-    Serial.print(" | Yaw: ");
-    Serial.print(currentYaw, 2);
+    Serial.print(" | ErrorDeg: ");
+    Serial.print(error, 2);
 
     Serial.print(" | M1Counts: ");
     Serial.print(readM1Counts());
