@@ -421,10 +421,11 @@ def main():
         joint0_euler = latest_joint_eulers.get("0")
 
         # Build status text shown in the figure.
-      
         status_text = f"IMU quats: {len(latest_imu_quats)}\n"
         status_text += f"Joint quats: {len(latest_joint_quats)}\n"
         status_text += f"Elbow quat angle: {elbow_angle:.1f}\n"
+        status_text += f"Elbow position: ({elbow[0]:.3f}, {elbow[1]:.3f}, {elbow[2]:.3f})\n"
+        status_text += f"Wrist position: ({wrist[0]:.3f}, {wrist[1]:.3f}, {wrist[2]:.3f})\n"
 
         if imu0_euler is not None:
             h, r, p = imu0_euler
@@ -432,7 +433,7 @@ def main():
         if imu1_euler is not None:
             h, r, p = imu1_euler
             status_text += f"\nIMU 1 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"
-        
+
         if joint0_euler is not None:
             h, r, p = joint0_euler
             status_text += f"\nJoint 1-0 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"
