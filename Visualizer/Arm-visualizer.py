@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
+3D arm visualizer and keyboard controller for the revised IMU motor-control sketch.
 
-- Press Z in the plot window to send "zero" to Arduino.
-- Press R to reset the Python-side visualization memory.
-- Press Q to quit.
+Expected Arduino serial telemetry includes lines like:
+  Measurement: ... | Mode: PID | TargetDeg: 30.00 | CurrentDeg: 12.34 | ErrorDeg: 17.66
+  qUpperZeroed: 1.000000, 0.000000, 0.000000, 0.000000
+  qForearmZeroed: 1.000000, 0.000000, 0.000000, 0.000000
+  qJointZeroed: 1.000000, 0.000000, 0.000000, 0.000000
 
-
+Keyboard controls inside the plot window:
+  0-9        send target angle = digit * 10 degrees
+  left       manual motor reverse
+  right      manual motor forward
+  s          stop both motors
+  r or z     zero/recalibrate Arduino
+  m          print Arduino menu
+  c          clear Python-side stored telemetry
+  q          quit visualizer
 """
 
 import re
 import threading
 from collections import deque
 
-import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.pyplot as plt
 import numpy as np
 import serial
 
@@ -22,18 +33,42 @@ import serial
 # Configuration
 # =====================
 
-SERIAL_PORT = "COM4"
-BAUD_RATE = 115200
+SERIAL_PORT = "COM8"
+BAUD_RATE = 9600
 
-UPPER_ARM_LENGTH = 0.30
-FOREARM_LENGTH = 0.25
+# Segment distances in meters. Tune these to match your actual mounting.
+SHOULDER_TO_UPPER_IMU = 0.10
+UPPER_IMU_TO_ELBOW = 0.20
+ELBOW_TO_FOREARM_IMU = 0.15
+FOREARM_IMU_TO_HAND = 0.10
 
-# Local direction of each arm segment in the IMU's own coordinate frame.
-# If the visual bends in the wrong plane, try [0, 1, 0] or [0, 0, 1].
-SEGMENT_AXIS_LOCAL = np.array([1.0, 0.0, 0.0])
+# Tracking axis: your testing showed the IMU/arm motion behaves correctly
+# when the arm segment is treated as the IMU's local +X axis.
+# Do not change this just to change the visual rest direction.
+IMU_SEGMENT_AXIS_LOCAL = np.array([1.0, 0.0, 0.0])
 
-# If the forearm points backward, set this to -1.0.
-FOREARM_DIRECTION_SIGN = 1.0
+# Display-only offset: rotate the correctly tracked +X arm direction so that
+# the zero/rest pose appears straight down along world -Z.
+# This is a +90 degree rotation about world Y: +X -> -Z.
+Q_DISPLAY_OFFSET = np.array([-0.7071067811865476, 0.0, 0.7071067811865476, 0.0])
+
+def quat_multiply(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ])
+
+Q_DISPLAY_OFFSET = quat_multiply(
+    [-0.7071067811865476, 0.0, 0.0, 0.7071067811865476],
+    Q_DISPLAY_OFFSET)
+
+# Flip these if either visual segment points opposite of the real arm.
+UPPER_DIRECTION_SIGN = -1.0
+FOREARM_DIRECTION_SIGN = -1.0
 
 MAX_DEBUG_LINES = 200
 
@@ -42,21 +77,19 @@ MAX_DEBUG_LINES = 200
 # Regex patterns
 # =====================
 
-IMU_HEADER_RE = re.compile(r"^\s*IMU\s+(\d+)\s+Cal")
-QUAT_RE = re.compile(
-    r"Quat\(w,x,y,z\)\s*:\s*"
-    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?),\s*"
-    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?),\s*"
-    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?),\s*"
-    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+FLOAT_RE = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
+
+Q_LABEL_RE = re.compile(
+    rf"^\s*(qUpperZeroed|qForearmZeroed|qJointZeroed)\s*:\s*"
+    rf"({FLOAT_RE}),\s*({FLOAT_RE}),\s*({FLOAT_RE}),\s*({FLOAT_RE})"
 )
-EULER_RE = re.compile(
-    r"Euler\(H,R,P\)\s*:\s*"
-    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?),\s*"
-    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?),\s*"
-    r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
-)
-JOINT_HEADER_RE = re.compile(r"^\s*Joint\s+(\d+)-(\d+)")
+
+CURRENT_DEG_RE = re.compile(rf"CurrentDeg\s*:\s*({FLOAT_RE})")
+TARGET_DEG_RE = re.compile(rf"TargetDeg\s*:\s*({FLOAT_RE})")
+ERROR_DEG_RE = re.compile(rf"ErrorDeg\s*:\s*({FLOAT_RE})")
+MODE_RE = re.compile(r"Mode\s*:\s*([A-Za-z]+)")
+TELEMETRY_SEEN = False
+COUNTS_RE = re.compile(r"M1Counts\s*:\s*(-?\d+)\s*\|\s*M2Counts\s*:\s*(-?\d+)")
 
 
 # =====================
@@ -65,22 +98,21 @@ JOINT_HEADER_RE = re.compile(r"^\s*Joint\s+(\d+)-(\d+)")
 
 line_queue = deque()
 debug_lines = deque(maxlen=MAX_DEBUG_LINES)
-
 stop_event = threading.Event()
 ser_global = None
 
-# Quaternions used for kinematics
-latest_imu_quats = {}       # IMU index string -> np.array([w, x, y, z])
-latest_joint_quats = {}     # parent IMU index string -> np.array([w, x, y, z])
-
-# Euler values are display-only
-latest_imu_eulers = {}      # IMU index string -> (heading, roll, pitch)
-latest_joint_eulers = {}    # parent IMU index string -> (heading, roll, pitch)
-
-parse_state = {
-    "current_imu": None,
-    "current_joint": None,
-    "pending_quat": None,
+latest = {
+    "q_upper": np.array([1.0, 0.0, 0.0, 0.0]),
+    "q_forearm": np.array([1.0, 0.0, 0.0, 0.0]),
+    "q_joint": np.array([1.0, 0.0, 0.0, 0.0]),
+    "current_deg": 0.0,
+    "target_deg": 0.0,
+    "error_deg": 0.0,
+    "mode": "unknown",
+    "m1_counts": 0,
+    "m2_counts": 0,
+    "lines_parsed": 0,
+    "quat_lines_parsed": 0,
 }
 
 
@@ -101,39 +133,41 @@ def quat_conjugate(q):
     return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
-def quat_multiply(q1, q2):
-    """Hamilton product for quaternions stored as [w, x, y, z]."""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ])
+# def quat_multiply(q1, q2):
+#     w1, x1, y1, z1 = q1
+#     w2, x2, y2, z2 = q2
+#     return np.array([
+#         w1*w2 - x1*x2 - y1*y2 - z1*z2,
+#         w1*x2 + x1*w2 + y1*z2 - z1*y2,
+#         w1*y2 - x1*z2 + y1*w2 + z1*x2,
+#         w1*z2 + x1*y2 - y1*x2 + z1*w2,
+#     ])
 
 
 def rotate_vector_by_quat(v, q):
-    """Rotate a 3D vector by quaternion q using q * v * q_conjugate."""
     q = normalize_quat(q)
     vq = np.array([0.0, v[0], v[1], v[2]])
-    rotated = quat_multiply(quat_multiply(q, vq), quat_conjugate(q))
-    return rotated[1:]
+    return quat_multiply(quat_multiply(q, vq), quat_conjugate(q))[1:]
+
+
+def unit_vector(v):
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return np.array([0.0, 0.0, -1.0])
+    return v / n
 
 
 def quat_angle_deg(q):
-    """Return the shortest rotation angle represented by q, in degrees."""
     q = normalize_quat(q)
     w = abs(np.clip(q[0], -1.0, 1.0))
-    return np.degrees(2.0 * np.arccos(w))
+    return float(np.degrees(2.0 * np.arccos(w)))
 
 
 # =====================
 # Serial functions
 # =====================
 
-# Open the serial port that communicates with the Arduino.
-# If the port cannot be opened, this returns None.
 def open_serial(port, baud):
     try:
         ser = serial.Serial(port, baud, timeout=0.1)
@@ -144,23 +178,20 @@ def open_serial(port, baud):
         return None
 
 
-# Send a text command to the Arduino. This is used by the key handler.
-def send_command(command):
-    global ser_global
-
+def send_serial(text, newline=True):
     if ser_global is None or not ser_global.is_open:
         print("Serial port is not open.")
         return
 
+    payload = text + ("\n" if newline else "")
     try:
-        ser_global.write((command + "\n").encode("utf-8"))
-        print(f"Sent command to Arduino: {command}")
+        ser_global.write(payload.encode("utf-8"))
+        printable = text.encode("unicode_escape").decode("ascii")
+        print(f"Sent: {printable}")
     except Exception as e:
-        print(f"Failed to send command: {e}")
+        print(f"Failed to send serial command: {e}")
 
 
-# Read lines from serial in a separate thread so the plot stays responsive.
-# Each received line is stored in `line_queue` for later parsing.
 def serial_reader_thread(ser):
     try:
         while not stop_event.is_set():
@@ -188,104 +219,51 @@ def serial_reader_thread(ser):
 # =====================
 
 def parse_line(line):
-    """Read one serial line and classify it by type.
+    latest["lines_parsed"] += 1
 
-    The Arduino output includes sections for IMU orientation and joint
-    relative rotation. This function finds the line type and returns a
-    simplified structure for later processing.
-    """
-    imu_match = IMU_HEADER_RE.search(line)
-    if imu_match:
-        return "imu_header", {"imu_id": int(imu_match.group(1))}
+    q_match = Q_LABEL_RE.search(line)
+    if q_match:
+        label = q_match.group(1)
+        q = normalize_quat([
+            float(q_match.group(2)),
+            float(q_match.group(3)),
+            float(q_match.group(4)),
+            float(q_match.group(5)),
+        ])
+        if label == "qUpperZeroed":
+            latest["q_upper"] = q
+        elif label == "qForearmZeroed":
+            latest["q_forearm"] = q
+        elif label == "qJointZeroed":
+            latest["q_joint"] = q
+        latest["quat_lines_parsed"] += 1
+        return
 
-    joint_match = JOINT_HEADER_RE.search(line)
-    if joint_match:
-        # Header format is Joint child-parent, e.g. Joint 1-0.
-        child = int(joint_match.group(1))
-        parent = int(joint_match.group(2))
-        return "joint_header", {"child": child, "parent": parent}
+    current_match = CURRENT_DEG_RE.search(line)
+    if current_match:
+        latest["current_deg"] = float(current_match.group(1))
 
-    quat_match = QUAT_RE.search(line)
-    if quat_match:
-        return "quaternion", {
-            "quat": np.array([
-                float(quat_match.group(1)),
-                float(quat_match.group(2)),
-                float(quat_match.group(3)),
-                float(quat_match.group(4)),
-            ])
-        }
+    target_match = TARGET_DEG_RE.search(line)
+    if target_match:
+        latest["target_deg"] = float(target_match.group(1))
 
-    euler_match = EULER_RE.search(line)
-    if euler_match:
-        return "euler", {
-            "euler": (
-                float(euler_match.group(1)),
-                float(euler_match.group(2)),
-                float(euler_match.group(3)),
-            )
-        }
+    error_match = ERROR_DEG_RE.search(line)
+    if error_match:
+        latest["error_deg"] = float(error_match.group(1))
 
-    if "==================" in line:
-        return "separator", {}
+    mode_match = MODE_RE.search(line)
+    if mode_match:
+        latest["mode"] = mode_match.group(1)
 
-    return None
+    counts_match = COUNTS_RE.search(line)
+    if counts_match:
+        latest["m1_counts"] = int(counts_match.group(1))
+        latest["m2_counts"] = int(counts_match.group(2))
 
 
 def update_latest_data():
-    """Process queued serial lines and update quaternion/euler dictionaries."""
     while line_queue:
-        line = line_queue.popleft()
-        result = parse_line(line)
-        if result is None:
-            continue
-
-        line_type, data = result
-
-        if line_type == "imu_header":
-            # Start reading a new IMU block.
-            parse_state["current_imu"] = data["imu_id"]
-            parse_state["current_joint"] = None
-            parse_state["pending_quat"] = None
-
-        elif line_type == "joint_header":
-            # Start reading a new joint block.
-            parse_state["current_joint"] = (data["child"], data["parent"])
-            parse_state["current_imu"] = None
-            parse_state["pending_quat"] = None
-
-        elif line_type == "quaternion":
-            # Store the quaternion until we get the matching Euler line.
-            parse_state["pending_quat"] = normalize_quat(data["quat"])
-
-        elif line_type == "euler":
-            # Once we have both quaternion and Euler for the same block,
-            # store them together for display or kinematics.
-            q = parse_state["pending_quat"]
-            if q is None:
-                continue
-
-            if parse_state["current_imu"] is not None:
-                key = str(parse_state["current_imu"])
-                latest_imu_quats[key] = q
-                latest_imu_eulers[key] = data["euler"]
-
-            elif parse_state["current_joint"] is not None:
-                child, parent = parse_state["current_joint"]
-                # Use the parent IMU index as the joint key.
-                key = str(parent)
-                latest_joint_quats[key] = q
-                latest_joint_eulers[key] = data["euler"]
-
-            parse_state["pending_quat"] = None
-            parse_state["current_imu"] = None
-            parse_state["current_joint"] = None
-
-        elif line_type == "separator":
-            # Reset parsing state at the end of an output block.
-            parse_state["current_imu"] = None
-            parse_state["current_joint"] = None
-            parse_state["pending_quat"] = None
+        parse_line(line_queue.popleft())
 
 
 # =====================
@@ -293,45 +271,31 @@ def update_latest_data():
 # =====================
 
 def build_arm_positions():
-    """Build the arm joint positions from the latest quaternion data."""
-    # The shoulder is fixed at the origin for this visualization.
+    """Return shoulder, upper IMU, elbow, forearm IMU, hand positions."""
     shoulder = np.array([0.0, 0.0, 0.0])
+    base_axis = unit_vector(IMU_SEGMENT_AXIS_LOCAL)
 
-    # The local segment axis is the direction of the arm segment in the IMU's
-    # own coordinate frame before any rotation is applied.
-    base_axis = SEGMENT_AXIS_LOCAL / np.linalg.norm(SEGMENT_AXIS_LOCAL)
+    # First apply the IMU's zeroed orientation for correct motion tracking.
+    # Then apply a display-only offset so the zero pose points downward.
+    q_upper_display = normalize_quat(quat_multiply(Q_DISPLAY_OFFSET, latest["q_upper"]))
+    q_forearm_display = normalize_quat(quat_multiply(Q_DISPLAY_OFFSET, latest["q_forearm"]))
 
-    q0 = latest_imu_quats.get("0")
-    q1 = latest_imu_quats.get("1")
-    q_joint_0 = latest_joint_quats.get("0")
+    upper_dir = rotate_vector_by_quat(base_axis * UPPER_DIRECTION_SIGN, q_upper_display)
+    forearm_dir = rotate_vector_by_quat(base_axis * FOREARM_DIRECTION_SIGN, q_forearm_display)
 
-    if q0 is not None:
-        # Rotate the base axis by IMU 0 to get the upper-arm direction.
-        upper_dir = rotate_vector_by_quat(base_axis, q0)
-    else:
-        upper_dir = base_axis.copy()
+    upper_dir = unit_vector(upper_dir)
+    forearm_dir = unit_vector(forearm_dir)
 
-    if q1 is not None:
-        # Use IMU 1 absolute orientation for the forearm direction.
-        forearm_dir = rotate_vector_by_quat(base_axis * FOREARM_DIRECTION_SIGN, q1)
-    elif q_joint_0 is not None:
-        # Fallback: use the relative joint quaternion if IMU 1 is not available.
-        forearm_dir = rotate_vector_by_quat(upper_dir * FOREARM_DIRECTION_SIGN, q_joint_0)
-    else:
-        # If no quaternion data exists, point the forearm in the same plane.
-        forearm_dir = upper_dir.copy() * FOREARM_DIRECTION_SIGN
+    upper_imu = shoulder + SHOULDER_TO_UPPER_IMU * upper_dir
+    elbow = shoulder + (SHOULDER_TO_UPPER_IMU + UPPER_IMU_TO_ELBOW) * upper_dir
+    forearm_imu = elbow + ELBOW_TO_FOREARM_IMU * forearm_dir
+    hand = elbow + (ELBOW_TO_FOREARM_IMU + FOREARM_IMU_TO_HAND) * forearm_dir
 
-    # Normalize the direction vectors so the visual lengths are stable.
-    upper_dir = upper_dir / np.linalg.norm(upper_dir)
-    forearm_dir = forearm_dir / np.linalg.norm(forearm_dir)
+    return shoulder, upper_imu, elbow, forearm_imu, hand
 
-    # Calculate world positions for the elbow and wrist.
-    elbow = shoulder + UPPER_ARM_LENGTH * upper_dir
-    wrist = elbow + FOREARM_LENGTH * forearm_dir
 
-    elbow_angle = quat_angle_deg(q_joint_0) if q_joint_0 is not None else 0.0
-
-    return shoulder, elbow, wrist, elbow_angle
+def fmt_point(name, p):
+    return f"{name}: ({p[0]: .3f}, {p[1]: .3f}, {p[2]: .3f})"
 
 
 # =====================
@@ -339,117 +303,117 @@ def build_arm_positions():
 # =====================
 
 def main():
-    """Start the Python visualizer and run the animation loop."""
-    global ser_global, latest_imu_quats, latest_joint_quats, latest_imu_eulers, latest_joint_eulers
+    global ser_global, latest
 
-    # Open the serial connection first.
     ser_global = open_serial(SERIAL_PORT, BAUD_RATE)
     if ser_global is None:
         return
 
-    # Read serial lines in a background thread so matplotlib stays responsive.
-    t = threading.Thread(target=serial_reader_thread, args=(ser_global,), daemon=True)
-    t.start()
+    reader = threading.Thread(target=serial_reader_thread, args=(ser_global,), daemon=True)
+    reader.start()
 
-    # Create a 3D matplotlib figure for the arm.
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
 
-    total_len = UPPER_ARM_LENGTH + FOREARM_LENGTH
-    lim = total_len + 0.1
+    total_len = SHOULDER_TO_UPPER_IMU + UPPER_IMU_TO_ELBOW + ELBOW_TO_FOREARM_IMU + FOREARM_IMU_TO_HAND
+    lim = total_len + 0.10
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_zlim(-lim, lim)
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
-    ax.set_title("Quaternion-Only 3D Arm Visualizer | Z=zero, R=reset, Q=quit")
+    ax.set_title("IMU Arm Visualizer + Motor Controller")
 
-    # Plot objects for the joints and bones.
-    shoulder_dot, = ax.plot([], [], [], "ko", markersize=6)
-    elbow_dot, = ax.plot([], [], [], "ro", markersize=6)
-    wrist_dot, = ax.plot([], [], [], "bo", markersize=6)
-    upper_line, = ax.plot([], [], [], "r-", linewidth=3)
-    fore_line, = ax.plot([], [], [], "b-", linewidth=3)
+    # Initialize the plot with the default straight-down arm immediately.
+    p0 = build_arm_positions()
+    shoulder_dot, = ax.plot([p0[0][0]], [p0[0][1]], [p0[0][2]], "o", markersize=7, label="Shoulder")
+    upper_imu_dot, = ax.plot([p0[1][0]], [p0[1][1]], [p0[1][2]], "^", markersize=6, label="Upper IMU")
+    elbow_dot, = ax.plot([p0[2][0]], [p0[2][1]], [p0[2][2]], "o", markersize=7, label="Elbow")
+    forearm_imu_dot, = ax.plot([p0[3][0]], [p0[3][1]], [p0[3][2]], "^", markersize=6, label="Forearm IMU")
+    hand_dot, = ax.plot([p0[4][0]], [p0[4][1]], [p0[4][2]], "o", markersize=7, label="Hand")
 
-    # Place the status text below the 3D axes to avoid overlapping with the visualization.
+    upper_line, = ax.plot([p0[0][0], p0[2][0]], [p0[0][1], p0[2][1]], [p0[0][2], p0[2][2]], linewidth=3)
+    forearm_line, = ax.plot([p0[2][0], p0[4][0]], [p0[2][1], p0[4][1]], [p0[2][2], p0[4][2]], linewidth=3)
+    ax.legend(loc="upper right")
+
     text = fig.text(0.02, 0.01, "", transform=fig.transFigure, verticalalignment="bottom", fontsize=9)
 
     def on_key(event):
-        """Handle keyboard controls from the plot window."""
-        global latest_imu_quats, latest_joint_quats, latest_imu_eulers, latest_joint_eulers
+        global latest
 
-        if event.key == "z":
-            # Send a zero command to the Arduino so it captures a reference orientation.
-            send_command("z")
-        elif event.key == "r":
-            # Clear all stored data in Python.
-            latest_imu_quats = {}
-            latest_joint_quats = {}
-            latest_imu_eulers = {}
-            latest_joint_eulers = {}
-            print("Reset Python-side visualizer state.")
+        if event.key in [str(i) for i in range(10)]:
+            send_serial(event.key)
+        elif event.key == "left":
+            send_serial("\x1b[D", newline=False)
+        elif event.key == "right":
+            send_serial("\x1b[C", newline=False)
+        elif event.key in ("r", "z"):
+            send_serial("r")
+        elif event.key == "s":
+            send_serial("s")
+        elif event.key == "m":
+            send_serial("m")
+        elif event.key == "c":
+            latest = {
+                "q_upper": np.array([1.0, 0.0, 0.0, 0.0]),
+                "q_forearm": np.array([1.0, 0.0, 0.0, 0.0]),
+                "q_joint": np.array([1.0, 0.0, 0.0, 0.0]),
+                "current_deg": 0.0,
+                "target_deg": 0.0,
+                "error_deg": 0.0,
+                "mode": "cleared",
+                "m1_counts": 0,
+                "m2_counts": 0,
+                "lines_parsed": 0,
+                "quat_lines_parsed": 0,
+            }
+            print("Cleared Python-side telemetry.")
         elif event.key == "q":
-            # Quit the visualizer cleanly.
             stop_event.set()
             plt.close(fig)
 
     fig.canvas.mpl_connect("key_press_event", on_key)
 
-    def update(frame):
-        """Update the arm pose and status text every animation frame."""
+    def update(_frame):
         update_latest_data()
 
-        shoulder, elbow, wrist, elbow_angle = build_arm_positions()
+        shoulder, upper_imu, elbow, forearm_imu, hand = build_arm_positions()
 
-        # Update the joint marker positions.
-        shoulder_dot.set_data([shoulder[0]], [shoulder[1]])
-        shoulder_dot.set_3d_properties([shoulder[2]])
-        elbow_dot.set_data([elbow[0]], [elbow[1]])
-        elbow_dot.set_3d_properties([elbow[2]])
-        wrist_dot.set_data([wrist[0]], [wrist[1]])
-        wrist_dot.set_3d_properties([wrist[2]])
+        points = [shoulder, upper_imu, elbow, forearm_imu, hand]
+        dots = [shoulder_dot, upper_imu_dot, elbow_dot, forearm_imu_dot, hand_dot]
+        for dot, p in zip(dots, points):
+            dot.set_data([p[0]], [p[1]])
+            dot.set_3d_properties([p[2]])
 
-        # Update the bone line segments.
         upper_line.set_data([shoulder[0], elbow[0]], [shoulder[1], elbow[1]])
         upper_line.set_3d_properties([shoulder[2], elbow[2]])
-        fore_line.set_data([elbow[0], wrist[0]], [elbow[1], wrist[1]])
-        fore_line.set_3d_properties([elbow[2], wrist[2]])
 
-        imu0_euler = latest_imu_eulers.get("0")
-        imu1_euler = latest_imu_eulers.get("1")
-        joint0_euler = latest_joint_eulers.get("0")
+        forearm_line.set_data([elbow[0], hand[0]], [elbow[1], hand[1]])
+        forearm_line.set_3d_properties([elbow[2], hand[2]])
 
-        # Build status text shown in the figure.
-        status_text = f"IMU quats: {len(latest_imu_quats)}\n"
-        status_text += f"Joint quats: {len(latest_joint_quats)}\n"
-        status_text += f"Elbow quat angle: {elbow_angle:.1f}\n"
-        status_text += f"Elbow position: ({elbow[0]:.3f}, {elbow[1]:.3f}, {elbow[2]:.3f})\n"
-        status_text += f"Wrist position: ({wrist[0]:.3f}, {wrist[1]:.3f}, {wrist[2]:.3f})\n"
+        joint_display_deg = latest["current_deg"]
+        if latest["quat_lines_parsed"] > 0 and abs(joint_display_deg) < 1e-9:
+            joint_display_deg = quat_angle_deg(latest["q_joint"])
 
-        if imu0_euler is not None:
-            h, r, p = imu0_euler
-            status_text += f"\nIMU 0 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"
-        if imu1_euler is not None:
-            h, r, p = imu1_euler
-            status_text += f"\nIMU 1 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"
+        status = [
+            "Keys: 0-9 target | left/right manual | s stop | r/z zero | m menu | c clear | q quit",
+            f"Mode: {latest['mode']} | Target: {latest['target_deg']:.2f} deg | Joint: {joint_display_deg:.2f} deg | Error: {latest['error_deg']:.2f} deg",
+            f"M1Counts: {latest['m1_counts']} | M2Counts: {latest['m2_counts']} | Parsed lines: {latest['lines_parsed']} | Quaternion lines: {latest['quat_lines_parsed']}",
+            fmt_point("Shoulder", shoulder),
+            fmt_point("Upper IMU", upper_imu),
+            fmt_point("Elbow", elbow),
+            fmt_point("Forearm IMU", forearm_imu),
+            fmt_point("Hand", hand),
+        ]
+        text.set_text("\n".join(status))
 
-        if joint0_euler is not None:
-            h, r, p = joint0_euler
-            status_text += f"\nJoint 1-0 Euler H,R,P: {h:.1f}, {r:.1f}, {p:.1f}"
+        return (*dots, upper_line, forearm_line, text)
 
-        status_text += "\n\nZ=zero, R=reset, Q=quit"
-        text.set_text(status_text)
-
-        return shoulder_dot, elbow_dot, wrist_dot, upper_line, fore_line, text
-
-    ani = animation.FuncAnimation(
-        fig,
-        update,
-        interval=50,
-        blit=False,
-        cache_frame_data=False,
-    )
+    # Keep a reference to the animation. Without this, Matplotlib can garbage-collect
+    # the animation object and the update function may never run.
+    ani = animation.FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
+    fig._arm_visualizer_animation = ani
 
     try:
         plt.show()

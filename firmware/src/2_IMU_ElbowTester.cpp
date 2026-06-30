@@ -11,44 +11,43 @@
 
 
 // =========================
-// IMU
+// IMU SETUP
 // =========================
-//
 // Two BNO055s on separate Teensy I2C buses.
-// Upper-arm/base IMU:   Wire
-// Forearm/moving IMU:  Wire1
+// Upper-arm/base IMU:  Wire
+// Forearm/moving IMU: Wire1
 //
-// The controller uses one scalar measurement:
-//   jointAngleDeg = forearm angle relative to upper arm
+// Joint angle is computed from the zeroed relative quaternion:
+//   qRelRaw   = conjugate(qUpperRaw) * qForearmRaw
+//   qJoint    = conjugate(qRelZero)  * qRelRaw
+//   joint deg = magnitude of qJoint
 //
-// That angle is computed from relative quaternions, not Euler angles.
+// After imuZero(), qUpper, qForearm, qRel, and qJoint all report identity
+// at the zero pose: (1, 0, 0, 0). The raw sensor quaternions are still read
+// from the BNO055s, but the printed/control quaternions are zeroed values.
 
-Adafruit_BNO055 bnoUpper(0, 0x28, &Wire);
-Adafruit_BNO055 bnoForearm(1, 0x28, &Wire1);
+Adafruit_BNO055 bnoUpper(0, 0x28, &Wire1);
+Adafruit_BNO055 bnoForearm(1, 0x28, &Wire);
 
 bool imuUpperOk = false;
 bool imuForearmOk = false;
 
-imu::Quaternion qUpper;
-imu::Quaternion qForearm;
-imu::Quaternion qRel;
-imu::Quaternion qZeroRel(1.0, 0.0, 0.0, 0.0);
+imu::Quaternion qUpperRaw(1.0, 0.0, 0.0, 0.0);
+imu::Quaternion qForearmRaw(1.0, 0.0, 0.0, 0.0);
+
+imu::Quaternion qUpperZero(1.0, 0.0, 0.0, 0.0);
+imu::Quaternion qForearmZero(1.0, 0.0, 0.0, 0.0);
+imu::Quaternion qRelZero(1.0, 0.0, 0.0, 0.0);
+
+// Zeroed telemetry/control quaternions.
+imu::Quaternion qUpper(1.0, 0.0, 0.0, 0.0);
+imu::Quaternion qForearm(1.0, 0.0, 0.0, 0.0);
+imu::Quaternion qRel(1.0, 0.0, 0.0, 0.0);
+imu::Quaternion qJoint(1.0, 0.0, 0.0, 0.0);
 
 float jointRawDeg = 0.0;
 float jointAngleDeg = 0.0;
 
-// This magnitude-only version does not require hinge-axis selection.
-// It measures the size of the zeroed relative rotation between the two IMUs.
-// Output is always positive: 0 deg to 180 deg.
-
-
-// =========================
-// CONTROL MODE
-// =========================
-//
-// This version is fixed to one quaternion-based joint angle magnitude.
-// No X/Y/Z hinge axis is selected.
-// Serial choices: r = zero, 0-9 = target, s = stop, m = menu.
 
 // =========================
 // MOTOR PINS
@@ -83,9 +82,6 @@ const int M2_ENC_SIGN = 1;
 const int M1_MOT_SIGN = 1;
 const int M2_MOT_SIGN = 1;
 
-// Roll mode:
-// Motor 1 turns the IMU.
-// Motor 2 runs opposite.
 const int M1_ROLL_SIGN = 1;
 const int M2_ROLL_SIGN = -1;
 
@@ -146,7 +142,7 @@ Motor m1 = {
   M1_ENC_SIGN, M1_MOT_SIGN, M1_ROLL_SIGN,
   1.75, 0.0, 0.125,
   150, 225, 150,
-  1.0, 5.0, 12000,
+  1.0, 5.0, 10000,
   0.0, 0.0, 0.0,
   false, false, false,
   0
@@ -158,7 +154,7 @@ Motor m2 = {
   M2_ENC_SIGN, M2_MOT_SIGN, M2_ROLL_SIGN,
   1.75, 0.0, 0.125,
   150, 225, 150,
-  1.0, 5.0, 12000,
+  1.0, 5.0, 10000,
   0.0, 0.0, 0.0,
   false, false, false,
   0
@@ -166,6 +162,11 @@ Motor m2 = {
 
 unsigned long lastCtrlUs = 0;
 unsigned long lastPrintMs = 0;
+
+bool manualMode = false;
+int manualDir = 0;
+
+int escState = 0;
 
 
 // =========================
@@ -175,12 +176,13 @@ unsigned long lastPrintMs = 0;
 void imuStart();
 void imuRead();
 void imuZero();
-
 bool imuReady();
 
-imu::Quaternion normalizeQ(imu::Quaternion q);
+imu::Quaternion unitQ(imu::Quaternion q);
+imu::Quaternion zeroAgainst(const imu::Quaternion& raw, const imu::Quaternion& zero);
 imu::Quaternion relativeQ(const imu::Quaternion& upper, const imu::Quaternion& forearm);
 float relativeAngleMagnitudeDeg(const imu::Quaternion& q);
+void printQuat(const char* label, const imu::Quaternion& q);
 
 float angDiff(float nowAng, float zeroAng);
 float errDeg(float target, float current);
@@ -198,6 +200,8 @@ bool motorEnabled(Motor& m);
 void setTarget(Motor& m, float targetDeg, int pwm);
 void resetMotor(Motor& m);
 void resetTargets();
+void stopManual();
+void startManual(int dir);
 
 long counts(Motor& m);
 
@@ -207,6 +211,7 @@ void hold(Motor& m);
 
 void serialCheck();
 void handleCmd(char c);
+void handleArrow(char arrowCode);
 void printData();
 
 
@@ -233,21 +238,11 @@ void setup() {
 
   Serial.println();
   Serial.println("System ready.");
-
-  Serial.println();
   Serial.println("Place the mechanism at the zero position.");
-  Serial.print("Selected measurement: ");
-  Serial.println(axisName());
-  Serial.println("Type r and press Enter to recalibrate the current joint position to 0.");
+  Serial.println("Type r and press Enter to zero the IMUs and joint angle.");
   Serial.println();
 
   waitCal();
-
-  imuRead();
-
-  m1.target = axisVal();
-  m2.target = axisVal();
-
   menu();
 
   lastCtrlUs = micros();
@@ -263,35 +258,24 @@ void loop() {
 // =========================
 
 void imuStart() {
-  Serial.println("Starting two BNO055 IMUs...");
+  Serial.println("Starting two BNO055 IMUs in default fusion mode...");
 
   Wire.begin();
   Wire1.begin();
 
-  if (bnoUpper.begin()) {
-    imuUpperOk = true;
+  imuUpperOk = bnoUpper.begin();
+  if (imuUpperOk) {
     Serial.println("Upper-arm BNO055 detected on Wire.");
     delay(500);
-    bnoUpper.setExtCrystalUse(true);  
-    // Use IMU-only fusion to avoid magnetometer-based heading
-    // inconsistencies which can make the relative orientation change
-    // when the whole system is rotated. IMU mode uses accel+gyro.
-    bnoUpper.setMode(OPERATION_MODE_IMUPLUS);
-    delay(200);
   } else {
-    imuUpperOk = false;
     Serial.println("Upper-arm BNO055 NOT detected on Wire.");
   }
 
-  if (bnoForearm.begin()) {
-    imuForearmOk = true;
+  imuForearmOk = bnoForearm.begin();
+  if (imuForearmOk) {
     Serial.println("Forearm BNO055 detected on Wire1.");
     delay(500);
-    bnoForearm.setExtCrystalUse(true);
-    bnoForearm.setMode(OPERATION_MODE_IMUPLUS);
-    delay(200);
   } else {
-    imuForearmOk = false;
     Serial.println("Forearm BNO055 NOT detected on Wire1.");
   }
 }
@@ -300,63 +284,22 @@ bool imuReady() {
   return imuUpperOk && imuForearmOk;
 }
 
-imu::Quaternion normalizeQ(imu::Quaternion q) {
-  float mag = sqrt(
-    q.w()*q.w() +
-    q.x()*q.x() +
-    q.y()*q.y() +
-    q.z()*q.z()
-  );
-
-  if (isnan(mag) || mag < 0.000001) {
-    return imu::Quaternion(1.0, 0.0, 0.0, 0.0);
-  }
-
+imu::Quaternion unitQ(imu::Quaternion q) {
   q.normalize();
   return q;
 }
 
-imu::Quaternion relativeQ(const imu::Quaternion& upper, const imu::Quaternion& forearm) {
-  // Rotation of forearm IMU relative to upper-arm IMU.
-  // If both IMUs rotate together in space, this relative rotation should stay constant.
-  imu::Quaternion upperInv = upper.conjugate();
-  imu::Quaternion rel = upperInv * forearm;
-  return normalizeQ(rel);
+imu::Quaternion zeroAgainst(const imu::Quaternion& raw, const imu::Quaternion& zero) {
+  return unitQ(zero.conjugate() * raw);
 }
 
-// Magnitude-only relative joint angle.
-// This ignores the quaternion axis and uses only the size of the zeroed relative rotation.
-// For a true 1-DOF joint, this should change when the joint bends and stay nearly constant
-// when the entire arm/person rotates without changing the joint angle.
-// Output is always positive: +45 and -45 both report 45.
+imu::Quaternion relativeQ(const imu::Quaternion& upper, const imu::Quaternion& forearm) {
+  return unitQ(upper.conjugate() * forearm);
+}
+
 float relativeAngleMagnitudeDeg(const imu::Quaternion& q) {
-  float w = q.w();
-  float x = q.x();
-  float y = q.y();
-  float z = q.z();
-
-  if (isnan(w) || isnan(x) || isnan(y) || isnan(z)) {
-    return jointAngleDeg; // keep last good value
-  }
-
-  // Normalize again defensively in case numerical error accumulated.
-  float mag = sqrt(w*w + x*x + y*y + z*z);
-  if (isnan(mag) || mag < 0.000001) {
-    return jointAngleDeg;
-  }
-
-  w = w / mag;
-
-  // Keep acos input valid even if numerical noise makes w slightly outside [-1, 1].
-  w = constrain(w, -1.0, 1.0);
-
-  // q and -q represent the same orientation. fabs(w) returns the shortest rotation magnitude.
+  float w = constrain(q.w(), -1.0, 1.0);
   float angleRad = 2.0 * acos(fabs(w));
-
-  if (isnan(angleRad)) {
-    return jointAngleDeg;
-  }
-
   float angleDeg = angleRad * 180.0 / PI;
 
   if (angleDeg < 0.0001) {
@@ -365,20 +308,21 @@ float relativeAngleMagnitudeDeg(const imu::Quaternion& q) {
 
   return angleDeg;
 }
+
 void imuRead() {
   if (!imuReady()) {
     return;
   }
 
-  qUpper = normalizeQ(bnoUpper.getQuat());
-  qForearm = normalizeQ(bnoForearm.getQuat());
+  qUpperRaw = unitQ(bnoUpper.getQuat());
+  qForearmRaw = unitQ(bnoForearm.getQuat());
 
-  qRel = relativeQ(qUpper, qForearm);
+  qUpper = zeroAgainst(qUpperRaw, qUpperZero);
+  qForearm = zeroAgainst(qForearmRaw, qForearmZero);
 
-  // Remove the zero/reference relative orientation.
-  // After imuZero(), the current pose reports as 0 degrees.
-  imu::Quaternion zeroInv = qZeroRel.conjugate();
-  imu::Quaternion qJoint = normalizeQ(zeroInv * qRel);
+  imu::Quaternion qRelRaw = relativeQ(qUpperRaw, qForearmRaw);
+  qRel = zeroAgainst(qRelRaw, qRelZero);
+  qJoint = qRel;
 
   jointRawDeg = relativeAngleMagnitudeDeg(qJoint);
   jointAngleDeg = jointRawDeg;
@@ -386,21 +330,47 @@ void imuRead() {
 
 void imuZero() {
   if (!imuReady()) {
-    Serial.println("Cannot recalibrate: one or both IMUs are not ready.");
+    Serial.println("Cannot zero: one or both IMUs are not ready.");
     return;
   }
 
-  qUpper = normalizeQ(bnoUpper.getQuat());
-  qForearm = normalizeQ(bnoForearm.getQuat());
+  qUpperRaw = unitQ(bnoUpper.getQuat());
+  qForearmRaw = unitQ(bnoForearm.getQuat());
 
-  qZeroRel = relativeQ(qUpper, qForearm);
+  qUpperZero = qUpperRaw;
+  qForearmZero = qForearmRaw;
+  qRelZero = relativeQ(qUpperRaw, qForearmRaw);
+
+  qUpper = imu::Quaternion(1.0, 0.0, 0.0, 0.0);
+  qForearm = imu::Quaternion(1.0, 0.0, 0.0, 0.0);
+  qRel = imu::Quaternion(1.0, 0.0, 0.0, 0.0);
+  qJoint = imu::Quaternion(1.0, 0.0, 0.0, 0.0);
 
   jointRawDeg = 0.0;
   jointAngleDeg = 0.0;
 
-  resetTargets();
+  stopManual();
+  resetMotor(m1);
+  resetMotor(m2);
+  m1.target = 0.0;
+  m2.target = 0.0;
+  off(m1);
+  off(m2);
 
-  Serial.println("IMUs recalibrated. Current upper-arm/forearm joint position is now 0.");
+  Serial.println("IMUs zeroed. Joint angle and zeroed quaternion outputs are now reset.");
+  menu();
+}
+
+void printQuat(const char* label, const imu::Quaternion& q) {
+  Serial.print(label);
+  Serial.print(": ");
+  Serial.print(q.w(), 6);
+  Serial.print(", ");
+  Serial.print(q.x(), 6);
+  Serial.print(", ");
+  Serial.print(q.y(), 6);
+  Serial.print(", ");
+  Serial.println(q.z(), 6);
 }
 
 float angDiff(float nowAng, float zeroAng) {
@@ -430,10 +400,8 @@ float axisRaw() {
 }
 
 const char* axisName() {
-  return "relative quaternion angle magnitude";
+  return "zeroed relative quaternion angle magnitude";
 }
-
-
 
 
 // =========================
@@ -451,7 +419,7 @@ void waitCal() {
 
       if (c == 'r' || c == 'R') {
         imuZero();
-        Serial.println("Calibration complete.");
+        Serial.println("Zero complete.");
         Serial.println();
         return;
       }
@@ -461,35 +429,24 @@ void waitCal() {
         continue;
       }
 
-      Serial.println("Please type r and press Enter to recalibrate first.");
+      Serial.println("Please type r and press Enter to zero first.");
     }
   }
 }
 
-
 void menu() {
+  Serial.println();
   Serial.println("Serial control mode is ON.");
   Serial.print("Active measurement: ");
   Serial.println(axisName());
-  Serial.println("Type a number and press Enter to move Motor 2 to that joint angle:");
-  Serial.println("Motor 2 controls the zeroed relative quaternion angle magnitude.");
-  Serial.println("Motor 1 is kept stopped in this version.");
-  Serial.println("0 = 0 deg");
-  Serial.println("1 = 10 deg");
-  Serial.println("2 = 20 deg");
-  Serial.println("3 = 30 deg");
-  Serial.println("4 = 40 deg");
-  Serial.println("5 = 50 deg");
-  Serial.println("6 = 60 deg");
-  Serial.println("7 = 70 deg");
-  Serial.println("8 = 80 deg");
-  Serial.println("9 = 90 deg");
+  Serial.println("0-9 = target from 0 to 90 degrees");
+  Serial.println("Left arrow = manual Motor 2 reverse");
+  Serial.println("Right arrow = manual Motor 2 forward");
   Serial.println("s = stop both motors");
-  Serial.println("r = recalibrate joint angle to 0");
+  Serial.println("r = reset");
   Serial.println("m = print menu");
   Serial.println();
 }
-
 
 
 // =========================
@@ -514,6 +471,13 @@ void updateAll() {
 
   imuRead();
 
+  if (manualMode) {
+    off(m1);
+    drive(m2, manualDir * m2.motSign, CMD_PWM);
+    printData();
+    return;
+  }
+
   pid(m1, dt, motorEnabled(m1));
   pid(m2, dt, motorEnabled(m2));
 
@@ -523,9 +487,6 @@ void updateAll() {
 }
 
 bool motorEnabled(Motor& m) {
-  // This version is a 1-DOF joint controller.
-  // Motor 2 is controlled by the quaternion joint angle.
-  // Motor 1 is kept off for now.
   if (&m == &m1) {
     return false;
   }
@@ -607,31 +568,32 @@ void pid(Motor& m, float dt, bool enabled) {
   }
 
   // Timeout: fully off, not hold.
-  if (millis() - m.startMs > m.timeout) {
-    off(m);
-    resetMotor(m);
+  // TIMEOUT TEMP COMMENTED OUT UNCOMMENT IF STATEMENT TO ENABLE
+  // if (millis() - m.startMs > m.timeout) {
+  //   off(m);
+  //   resetMotor(m);
 
-    Serial.println();
-    Serial.print(m.name);
-    Serial.println(" move timed out. Motor is fully OFF.");
+  //   Serial.println();
+  //   Serial.print(m.name);
+  //   Serial.println(" move timed out. Motor is fully OFF.");
 
-    Serial.print("Measurement: ");
-    Serial.print(axisName());
+  //   Serial.print("Measurement: ");
+  //   Serial.print(axisName());
 
-    Serial.print(" | TargetDeg: ");
-    Serial.print(m.target, 2);
+  //   Serial.print(" | TargetDeg: ");
+  //   Serial.print(m.target, 2);
 
-    Serial.print(" | CurrentDeg: ");
-    Serial.print(axisVal(), 2);
+  //   Serial.print(" | CurrentDeg: ");
+  //   Serial.print(axisVal(), 2);
 
-    Serial.print(" | ErrorDeg: ");
-    Serial.println(errDeg(m.target, axisVal()), 2);
+  //   Serial.print(" | ErrorDeg: ");
+  //   Serial.println(errDeg(m.target, axisVal()), 2);
 
-    Serial.println("Choose another target or recalibrate with r.");
-    Serial.println();
+  //   Serial.println("Choose another target or zero with r.");
+  //   Serial.println();
 
-    return;
-  }
+  //   return;
+  // }
 
   float dErr = (error - m.lastErr) / dt;
 
@@ -708,6 +670,7 @@ void resetMotor(Motor& m) {
 }
 
 void resetTargets() {
+  stopManual();
   imuRead();
 
   m1.target = axisVal();
@@ -718,6 +681,26 @@ void resetTargets() {
 
   off(m1);
   off(m2);
+}
+
+void stopManual() {
+  manualMode = false;
+  manualDir = 0;
+}
+
+void startManual(int dir) {
+  resetMotor(m1);
+  resetMotor(m2);
+  off(m1);
+
+  manualMode = true;
+  manualDir = dir;
+
+  Serial.println();
+  Serial.print("Manual mode: Motor 2 turning ");
+  Serial.println(dir == FWD ? "forward." : "reverse.");
+  Serial.println("Press s to stop, r to zero, or 0-9 to return to PID target mode.");
+  Serial.println();
 }
 
 long counts(Motor& m) {
@@ -771,6 +754,22 @@ void serialCheck() {
   while (Serial.available() > 0) {
     char c = Serial.read();
 
+    if (escState == 0 && c == 27) {
+      escState = 1;
+      continue;
+    }
+
+    if (escState == 1) {
+      escState = (c == '[') ? 2 : 0;
+      continue;
+    }
+
+    if (escState == 2) {
+      handleArrow(c);
+      escState = 0;
+      continue;
+    }
+
     if (c == '\n' || c == '\r') {
       continue;
     }
@@ -779,13 +778,21 @@ void serialCheck() {
   }
 }
 
+void handleArrow(char arrowCode) {
+  if (arrowCode == 'D') {       // left arrow
+    startManual(REV);
+  }
+  else if (arrowCode == 'C') {  // right arrow
+    startManual(FWD);
+  }
+}
+
 void handleCmd(char c) {
   if (c >= '0' && c <= '9') {
     int key = c - '0';
     float target = KEY_TARGETS[key];
 
-    // 1-DOF mode: Motor 2 controls the quaternion-derived joint angle.
-    // Motor 1 stays stopped.
+    stopManual();
     imuRead();
 
     off(m1);
@@ -794,18 +801,13 @@ void handleCmd(char c) {
 
     setTarget(m2, target, CMD_PWM);
 
-    Serial.println("Joint-angle mode active: Motor 2 is controlling the quaternion-derived joint angle. Motor 1 is stopped.");
+    Serial.println("Joint-angle PID mode active: Motor 2 is controlling the quaternion-derived joint angle. Motor 1 is stopped.");
     Serial.println();
     return;
   }
 
-
   if (c == 'r' || c == 'R') {
     imuZero();
-
-    Serial.println("Target reset to current joint angle after IMU zero.");
-    Serial.println("Choose a number target when ready.");
-    Serial.println();
     return;
   }
 
@@ -835,25 +837,15 @@ void printData() {
   if (millis() - lastPrintMs >= PRINT_MS) {
     lastPrintMs = millis();
 
-    float targetDeg = m2.target;
+    float targetDeg = manualMode ? axisVal() : m2.target;
     float currentDeg = axisVal();
-    float errorDeg = errDeg(targetDeg, currentDeg);
+    float errorDeg = manualMode ? 0.0 : errDeg(targetDeg, currentDeg);
 
-    // Teleplot output
-    Serial.print(">targetDeg:");
-    Serial.println(targetDeg, 2);
 
-    Serial.print(">currentDeg:");
-    Serial.println(currentDeg, 2);
 
-    Serial.print(">errorDeg:");
-    Serial.println(errorDeg, 2);
 
-    // Readable output
-    Serial.print("Measurement: ");
-    Serial.print(axisName());
 
-    Serial.print(" | TargetDeg: ");
+    Serial.print("\nTargetDeg: ");
     Serial.print(targetDeg, 2);
 
     Serial.print(" | CurrentDeg: ");
@@ -862,27 +854,14 @@ void printData() {
     Serial.print(" | ErrorDeg: ");
     Serial.print(errorDeg, 2);
 
-    Serial.print(" | M1Counts: ");
+    Serial.print("\nM1Counts: ");
     Serial.print(counts(m1));
 
     Serial.print(" | M2Counts: ");
     Serial.println(counts(m2));
-    // Quaternion telemetry for each IMU
-    Serial.print("q1: ");
-    Serial.print(q1.w(), 6);
-    Serial.print(", ");
-    Serial.print(q1.x(), 6);
-    Serial.print(", ");
-    Serial.print(q1.y(), 6);
-    Serial.print(", ");
-    Serial.println(q1.z(), 6);
-    Serial.print("q2: ");
-    Serial.print(q2.w(), 6);
-    Serial.print(", ");
-    Serial.print(q2.x(), 6);
-    Serial.print(", ");
-    Serial.print(q2.y(), 6);
-    Serial.print(", ");
-    Serial.println(q2.z(), 6);
+
+    printQuat("qUpperZeroed", qUpper);
+    printQuat("qForearmZeroed", qForearm);
+    printQuat("qJointZeroed", qJoint);
   }
 }
