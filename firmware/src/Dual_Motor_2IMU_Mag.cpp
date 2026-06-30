@@ -867,5 +867,22 @@ void printData() {
 
     Serial.print(" | M2Counts: ");
     Serial.println(counts(m2));
+    // Quaternion telemetry for each IMU
+    Serial.print("q1: ");
+    Serial.print(q1.w(), 6);
+    Serial.print(", ");
+    Serial.print(q1.x(), 6);
+    Serial.print(", ");
+    Serial.print(q1.y(), 6);
+    Serial.print(", ");
+    Serial.println(q1.z(), 6);
+    Serial.print("q2: ");
+    Serial.print(q2.w(), 6);
+    Serial.print(", ");
+    Serial.print(q2.x(), 6);
+    Serial.print(", ");
+    Serial.print(q2.y(), 6);
+    Serial.print(", ");
+    Serial.println(q2.z(), 6);
   }
 }
