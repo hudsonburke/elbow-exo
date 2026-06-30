@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
-"""
-3D arm visualizer and keyboard controller for the revised IMU motor-control sketch.
 
-Expected Arduino serial telemetry includes lines like:
-  Measurement: ... | Mode: PID | TargetDeg: 30.00 | CurrentDeg: 12.34 | ErrorDeg: 17.66
-  qUpperZeroed: 1.000000, 0.000000, 0.000000, 0.000000
-  qForearmZeroed: 1.000000, 0.000000, 0.000000, 0.000000
-  qJointZeroed: 1.000000, 0.000000, 0.000000, 0.000000
+# Keyboard controls inside the plot window:
+#   0-9        send target angle = digit * 10 degrees
+#   left       manual motor reverse
+#   right      manual motor forward
+#   s          stop both motors
+#   r          recalibrate Arduino
+#   m          print Arduino menu
+#   c          clear Python-side stored telemetry
+#   q          quit visualizer
 
-Keyboard controls inside the plot window:
-  0-9        send target angle = digit * 10 degrees
-  left       manual motor reverse
-  right      manual motor forward
-  s          stop both motors
-  r or z     zero/recalibrate Arduino
-  m          print Arduino menu
-  c          clear Python-side stored telemetry
-  q          quit visualizer
-"""
 
 import re
 import threading
@@ -37,10 +29,10 @@ SERIAL_PORT = "COM8"
 BAUD_RATE = 9600
 
 # Segment distances in meters. Tune these to match your actual mounting.
-SHOULDER_TO_UPPER_IMU = 0.10
-UPPER_IMU_TO_ELBOW = 0.20
-ELBOW_TO_FOREARM_IMU = 0.15
-FOREARM_IMU_TO_HAND = 0.10
+SHOULDER_TO_UPPER_IMU = 1
+UPPER_IMU_TO_ELBOW = 5.25
+ELBOW_TO_FOREARM_IMU = 3
+FOREARM_IMU_TO_HAND = 1
 
 # Tracking axis: your testing showed the IMU/arm motion behaves correctly
 # when the arm segment is treated as the IMU's local +X axis.
@@ -348,7 +340,7 @@ def main():
             send_serial("\x1b[D", newline=False)
         elif event.key == "right":
             send_serial("\x1b[C", newline=False)
-        elif event.key in ("r", "z"):
+        elif event.key in ("r"):
             send_serial("r")
         elif event.key == "s":
             send_serial("s")

@@ -88,9 +88,10 @@ const int M2_ROLL_SIGN = -1;
 const int MIN_PWM = 125;
 const int MAX_PWM = 255;
 const int CMD_PWM = 220;
+const int Man_speed = 100;
 
 const unsigned long CTRL_US = 10000;   // 10 ms
-const unsigned long PRINT_MS = 250;
+const unsigned long PRINT_MS = 200;
 
 const float KEY_TARGETS[10] = {
   0.0, 10.0, 20.0, 30.0, 40.0,
@@ -473,7 +474,7 @@ void updateAll() {
 
   if (manualMode) {
     off(m1);
-    drive(m2, manualDir * m2.motSign, CMD_PWM);
+    drive(m2, manualDir * m2.motSign, Man_speed);
     printData();
     return;
   }
