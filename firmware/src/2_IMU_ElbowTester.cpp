@@ -26,8 +26,8 @@
 // at the zero pose: (1, 0, 0, 0). The raw sensor quaternions are still read
 // from the BNO055s, but the printed/control quaternions are zeroed values.
 
-Adafruit_BNO055 bnoUpper(0, 0x28, &Wire1);
-Adafruit_BNO055 bnoForearm(1, 0x28, &Wire);
+Adafruit_BNO055 bnoUpper(0, 0x28, &Wire);
+Adafruit_BNO055 bnoForearm(1, 0x28, &Wire1);
 
 bool imuUpperOk = false;
 bool imuForearmOk = false;
@@ -47,6 +47,11 @@ imu::Quaternion qJoint(1.0, 0.0, 0.0, 0.0);
 
 float jointRawDeg = 0.0;
 float jointAngleDeg = 0.0;
+
+// IMU fault guard: brief bad/NaN reads are ignored so PID keeps using
+// the most recent valid joint angle instead of reacting to a corrupt sample.
+bool imuLastReadValid = true;
+unsigned long imuBadReadCount = 0;
 
 
 // =========================
@@ -88,7 +93,7 @@ const int M2_ROLL_SIGN = -1;
 const int MIN_PWM = 125;
 const int MAX_PWM = 255;
 const int CMD_PWM = 220;
-const int Man_speed = 100;
+const int Man_speed = 125;
 
 const unsigned long CTRL_US = 10000;   // 10 ms
 const unsigned long PRINT_MS = 200;
@@ -179,6 +184,9 @@ void imuRead();
 void imuZero();
 bool imuReady();
 
+bool finiteFloat(float v);
+bool validQ(const imu::Quaternion& q);
+float quatNorm(const imu::Quaternion& q);
 imu::Quaternion unitQ(imu::Quaternion q);
 imu::Quaternion zeroAgainst(const imu::Quaternion& raw, const imu::Quaternion& zero);
 imu::Quaternion relativeQ(const imu::Quaternion& upper, const imu::Quaternion& forearm);
@@ -285,6 +293,29 @@ bool imuReady() {
   return imuUpperOk && imuForearmOk;
 }
 
+bool finiteFloat(float v) {
+  return !isnan(v) && !isinf(v);
+}
+
+float quatNorm(const imu::Quaternion& q) {
+  return sqrt(
+    q.w() * q.w() +
+    q.x() * q.x() +
+    q.y() * q.y() +
+    q.z() * q.z()
+  );
+}
+
+bool validQ(const imu::Quaternion& q) {
+  if (!finiteFloat(q.w()) || !finiteFloat(q.x()) ||
+      !finiteFloat(q.y()) || !finiteFloat(q.z())) {
+    return false;
+  }
+
+  float n = quatNorm(q);
+  return finiteFloat(n) && n > 0.000001;
+}
+
 imu::Quaternion unitQ(imu::Quaternion q) {
   q.normalize();
   return q;
@@ -299,9 +330,17 @@ imu::Quaternion relativeQ(const imu::Quaternion& upper, const imu::Quaternion& f
 }
 
 float relativeAngleMagnitudeDeg(const imu::Quaternion& q) {
+  if (!validQ(q)) {
+    return jointAngleDeg;
+  }
+
   float w = constrain(q.w(), -1.0, 1.0);
   float angleRad = 2.0 * acos(fabs(w));
   float angleDeg = angleRad * 180.0 / PI;
+
+  if (!finiteFloat(angleDeg)) {
+    return jointAngleDeg;
+  }
 
   if (angleDeg < 0.0001) {
     angleDeg = 0.0;
@@ -312,21 +351,54 @@ float relativeAngleMagnitudeDeg(const imu::Quaternion& q) {
 
 void imuRead() {
   if (!imuReady()) {
+    imuLastReadValid = false;
+    imuBadReadCount++;
     return;
   }
 
-  qUpperRaw = unitQ(bnoUpper.getQuat());
-  qForearmRaw = unitQ(bnoForearm.getQuat());
+  imu::Quaternion upperRawNew = bnoUpper.getQuat();
+  imu::Quaternion forearmRawNew = bnoForearm.getQuat();
 
-  qUpper = zeroAgainst(qUpperRaw, qUpperZero);
-  qForearm = zeroAgainst(qForearmRaw, qForearmZero);
+  if (!validQ(upperRawNew) || !validQ(forearmRawNew)) {
+    // Ignore this sample and keep the previous valid quaternion/angle values.
+    imuLastReadValid = false;
+    imuBadReadCount++;
+    return;
+  }
 
-  imu::Quaternion qRelRaw = relativeQ(qUpperRaw, qForearmRaw);
-  qRel = zeroAgainst(qRelRaw, qRelZero);
-  qJoint = qRel;
+  upperRawNew = unitQ(upperRawNew);
+  forearmRawNew = unitQ(forearmRawNew);
 
-  jointRawDeg = relativeAngleMagnitudeDeg(qJoint);
-  jointAngleDeg = jointRawDeg;
+  imu::Quaternion upperNew = zeroAgainst(upperRawNew, qUpperZero);
+  imu::Quaternion forearmNew = zeroAgainst(forearmRawNew, qForearmZero);
+  imu::Quaternion relRawNew = relativeQ(upperRawNew, forearmRawNew);
+  imu::Quaternion relNew = zeroAgainst(relRawNew, qRelZero);
+  imu::Quaternion jointNew = relNew;
+
+  if (!validQ(upperNew) || !validQ(forearmNew) ||
+      !validQ(relNew) || !validQ(jointNew)) {
+    imuLastReadValid = false;
+    imuBadReadCount++;
+    return;
+  }
+
+  float angleNew = relativeAngleMagnitudeDeg(jointNew);
+  if (!finiteFloat(angleNew)) {
+    imuLastReadValid = false;
+    imuBadReadCount++;
+    return;
+  }
+
+  qUpperRaw = upperRawNew;
+  qForearmRaw = forearmRawNew;
+  qUpper = upperNew;
+  qForearm = forearmNew;
+  qRel = relNew;
+  qJoint = jointNew;
+
+  jointRawDeg = angleNew;
+  jointAngleDeg = angleNew;
+  imuLastReadValid = true;
 }
 
 void imuZero() {
@@ -335,8 +407,18 @@ void imuZero() {
     return;
   }
 
-  qUpperRaw = unitQ(bnoUpper.getQuat());
-  qForearmRaw = unitQ(bnoForearm.getQuat());
+  imu::Quaternion upperRawNew = bnoUpper.getQuat();
+  imu::Quaternion forearmRawNew = bnoForearm.getQuat();
+
+  if (!validQ(upperRawNew) || !validQ(forearmRawNew)) {
+    Serial.println("Cannot zero: invalid IMU quaternion sample.");
+    imuLastReadValid = false;
+    imuBadReadCount++;
+    return;
+  }
+
+  qUpperRaw = unitQ(upperRawNew);
+  qForearmRaw = unitQ(forearmRawNew);
 
   qUpperZero = qUpperRaw;
   qForearmZero = qForearmRaw;
@@ -349,6 +431,7 @@ void imuZero() {
 
   jointRawDeg = 0.0;
   jointAngleDeg = 0.0;
+  imuLastReadValid = true;
 
   stopManual();
   resetMotor(m1);

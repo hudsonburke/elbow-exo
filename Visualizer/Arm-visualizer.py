@@ -342,7 +342,7 @@ def main():
             send_serial("\x1b[C", newline=False)
         elif event.key in ("r"):
             send_serial("r")
-        elif event.key == "s":
+        elif event.key == "p":
             send_serial("s")
         elif event.key == "m":
             send_serial("m")
@@ -389,7 +389,7 @@ def main():
             joint_display_deg = quat_angle_deg(latest["q_joint"])
 
         status = [
-            "Keys: 0-9 target | left/right manual | s stop | r/z zero | m menu | c clear | q quit",
+            "Keys: 0-9 target | left/right manual | p pause | r recalibrate | m menu | c clear | q quit",
             f"Mode: {latest['mode']} | Target: {latest['target_deg']:.2f} deg | Joint: {joint_display_deg:.2f} deg | Error: {latest['error_deg']:.2f} deg",
             f"M1Counts: {latest['m1_counts']} | M2Counts: {latest['m2_counts']} | Parsed lines: {latest['lines_parsed']} | Quaternion lines: {latest['quat_lines_parsed']}",
             fmt_point("Shoulder", shoulder),
