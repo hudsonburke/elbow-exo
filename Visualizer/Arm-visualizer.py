@@ -8,11 +8,13 @@
 #   r          recalibrate Arduino
 #   m          print Arduino menu
 #   c          clear Python-side stored telemetry
+#   g          reset the joint angle graph
 #   q          quit visualizer
 
 
 import re
 import threading
+import time
 from collections import deque
 
 import matplotlib.animation as animation
@@ -304,8 +306,13 @@ def main():
     reader = threading.Thread(target=serial_reader_thread, args=(ser_global,), daemon=True)
     reader.start()
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
+    fig = plt.figure(figsize=(14, 7))
+    ax = fig.add_subplot(1, 2, 1, projection="3d")
+    angle_ax = fig.add_subplot(1, 2, 2)
+
+    history_time = deque(maxlen=300)
+    history_angle = deque(maxlen=300)
+    history_start_time = time.monotonic()
 
     total_len = SHOULDER_TO_UPPER_IMU + UPPER_IMU_TO_ELBOW + ELBOW_TO_FOREARM_IMU + FOREARM_IMU_TO_HAND
     lim = total_len + 0.10
@@ -329,10 +336,19 @@ def main():
     forearm_line, = ax.plot([p0[2][0], p0[4][0]], [p0[2][1], p0[4][1]], [p0[2][2], p0[4][2]], linewidth=3)
     ax.legend(loc="upper right")
 
+    angle_line, = angle_ax.plot([], [], color="tab:blue", linewidth=2, label="Joint angle")
+    angle_ax.set_title("Joint Angle vs Time")
+    angle_ax.set_xlabel("Time (s)")
+    angle_ax.set_ylabel("Angle (deg)")
+    angle_ax.grid(True, alpha=0.3)
+    angle_ax.set_ylim(-180, 180)
+    angle_ax.legend(loc="upper right")
+
     text = fig.text(0.02, 0.01, "", transform=fig.transFigure, verticalalignment="bottom", fontsize=9)
 
     def on_key(event):
         global latest
+        nonlocal history_start_time
 
         if event.key in [str(i) for i in range(10)]:
             send_serial(event.key)
@@ -346,6 +362,8 @@ def main():
             send_serial("s")
         elif event.key == "m":
             send_serial("m")
+        elif event.key == "o":
+            send_serial("o")
         elif event.key == "c":
             latest = {
                 "q_upper": np.array([1.0, 0.0, 0.0, 0.0]),
@@ -360,7 +378,20 @@ def main():
                 "lines_parsed": 0,
                 "quat_lines_parsed": 0,
             }
+            history_time.clear()
+            history_angle.clear()
+            history_start_time = time.monotonic()
+            angle_line.set_data([], [])
+            angle_ax.set_ylim(-180, 180)
             print("Cleared Python-side telemetry.")
+        elif event.key == "g":
+            history_time.clear()
+            history_angle.clear()
+            history_start_time = time.monotonic()
+            angle_line.set_data([], [])
+            angle_ax.set_xlim(0.0, 1.0)
+            angle_ax.set_ylim(-180, 180)
+            print("Reset joint angle graph.")
         elif event.key == "q":
             stop_event.set()
             plt.close(fig)
@@ -388,10 +419,18 @@ def main():
         if latest["quat_lines_parsed"] > 0 and abs(joint_display_deg) < 1e-9:
             joint_display_deg = quat_angle_deg(latest["q_joint"])
 
+        history_time.append(time.monotonic() - history_start_time)
+        history_angle.append(joint_display_deg)
+        angle_line.set_data(list(history_time), list(history_angle))
+        if history_angle:
+            angle_ax.set_xlim(0.0, max(1.0, history_time[-1] + 1.0))
+            min_angle = min(history_angle) - 5
+            max_angle = max(history_angle) + 5
+            angle_ax.set_ylim(min_angle, max_angle)
+
         status = [
-            "Keys: 0-9 target | left/right manual | p pause | r recalibrate | m menu | c clear | q quit",
-            f"Mode: {latest['mode']} | Target: {latest['target_deg']:.2f} deg | Joint: {joint_display_deg:.2f} deg | Error: {latest['error_deg']:.2f} deg",
-            f"M1Counts: {latest['m1_counts']} | M2Counts: {latest['m2_counts']} | Parsed lines: {latest['lines_parsed']} | Quaternion lines: {latest['quat_lines_parsed']}",
+            "Keys: 0-9 target | left/right manual | p pause | r recalibrate | m menu | c clear | g reset graph | q quit",
+            f"Target: {latest['target_deg']:.2f} deg | Joint: {joint_display_deg:.2f} deg | Error: {latest['error_deg']:.2f} deg",
             fmt_point("Shoulder", shoulder),
             fmt_point("Upper IMU", upper_imu),
             fmt_point("Elbow", elbow),
@@ -400,7 +439,7 @@ def main():
         ]
         text.set_text("\n".join(status))
 
-        return (*dots, upper_line, forearm_line, text)
+        return (*dots, upper_line, forearm_line, angle_line, text)
 
     # Keep a reference to the animation. Without this, Matplotlib can garbage-collect
     # the animation object and the update function may never run.

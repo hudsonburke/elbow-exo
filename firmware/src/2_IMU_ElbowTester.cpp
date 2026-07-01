@@ -176,6 +176,36 @@ int escState = 0;
 
 
 // =========================
+// OSCILLATE STATE
+// =========================
+// "o" starts a guided prompt: pick a target angle (0-9, same keys as the
+// normal PID mode), then pick a repetition count (1-9). One repetition is:
+// drive to the target angle, hold there for OSC_HOLD_MS, drive back to 0,
+// hold there for OSC_HOLD_MS. This repeats oscReps times. The whole thing
+// is implemented as a non-blocking state machine so serial input (s / r /
+// arrows / digits) keeps being serviced every cycle and can interrupt it.
+
+enum OscState {
+  OSC_IDLE,
+  OSC_WAIT_ANGLE,
+  OSC_WAIT_REPS,
+  OSC_TO_TARGET,
+  OSC_HOLD_TARGET,
+  OSC_TO_ZERO,
+  OSC_HOLD_ZERO
+};
+
+OscState oscState = OSC_IDLE;
+
+int oscAngleKey = 0;   // selected 0-9 key, maps to KEY_TARGETS
+int oscReps = 0;       // total repetitions requested
+int oscRepCount = 0;   // repetitions completed so far
+
+unsigned long oscHoldStartMs = 0;
+const unsigned long OSC_HOLD_MS = 3000; // hold time at each end, ms
+
+
+// =========================
 // FUNCTION DECLARATIONS
 // =========================
 
@@ -211,6 +241,10 @@ void resetMotor(Motor& m);
 void resetTargets();
 void stopManual();
 void startManual(int dir);
+
+void startOscillationRun();
+void handleOscillate();
+void cancelOscillate(const char* reason);
 
 long counts(Motor& m);
 
@@ -433,6 +467,7 @@ void imuZero() {
   jointAngleDeg = 0.0;
   imuLastReadValid = true;
 
+  oscState = OSC_IDLE;
   stopManual();
   resetMotor(m1);
   resetMotor(m2);
@@ -524,6 +559,7 @@ void menu() {
   Serial.print("Active measurement: ");
   Serial.println(axisName());
   Serial.println("0-9 = target from 0 to 90 degrees");
+  Serial.println("o = oscillate (choose angle 0-9, then repetitions 1-9)");
   Serial.println("Left arrow = manual Motor 2 reverse");
   Serial.println("Right arrow = manual Motor 2 forward");
   Serial.println("s = stop both motors");
@@ -564,6 +600,8 @@ void updateAll() {
 
   pid(m1, dt, motorEnabled(m1));
   pid(m2, dt, motorEnabled(m2));
+
+  handleOscillate();
 
   if (m1.active || m2.active) {
     printData();
@@ -754,6 +792,7 @@ void resetMotor(Motor& m) {
 }
 
 void resetTargets() {
+  oscState = OSC_IDLE;
   stopManual();
   imuRead();
 
@@ -773,6 +812,8 @@ void stopManual() {
 }
 
 void startManual(int dir) {
+  oscState = OSC_IDLE;
+
   resetMotor(m1);
   resetMotor(m2);
   off(m1);
@@ -789,6 +830,85 @@ void startManual(int dir) {
 
 long counts(Motor& m) {
   return m.enc->read() * m.encSign;
+}
+
+
+// =========================
+// OSCILLATE
+// =========================
+
+// Kicks off the actual back-and-forth run once angle + reps are both chosen.
+void startOscillationRun() {
+  stopManual();
+  imuRead();
+
+  off(m1);
+  resetMotor(m1);
+  m1.target = axisVal();
+
+  oscState = OSC_TO_TARGET;
+  setTarget(m2, KEY_TARGETS[oscAngleKey], CMD_PWM);
+}
+
+// Called once per control cycle from updateAll() (only outside manual mode).
+// Drives the target-hold-zero-hold-repeat sequence using m2's existing PID
+// (via setTarget) and hold (via m2.holding, which pid() already maintains).
+void handleOscillate() {
+  switch (oscState) {
+    case OSC_IDLE:
+    case OSC_WAIT_ANGLE:
+    case OSC_WAIT_REPS:
+      // Nothing to drive; waiting on user input or not running.
+      return;
+
+    case OSC_TO_TARGET:
+      if (m2.holding) {
+        oscState = OSC_HOLD_TARGET;
+        oscHoldStartMs = millis();
+      }
+      return;
+
+    case OSC_HOLD_TARGET:
+      if (millis() - oscHoldStartMs >= OSC_HOLD_MS) {
+        oscState = OSC_TO_ZERO;
+        setTarget(m2, 0.0, CMD_PWM);
+      }
+      return;
+
+    case OSC_TO_ZERO:
+      if (m2.holding) {
+        oscState = OSC_HOLD_ZERO;
+        oscHoldStartMs = millis();
+      }
+      return;
+
+    case OSC_HOLD_ZERO:
+      if (millis() - oscHoldStartMs >= OSC_HOLD_MS) {
+        oscRepCount++;
+
+        if (oscRepCount >= oscReps) {
+          oscState = OSC_IDLE;
+          Serial.println();
+          Serial.println("Oscillate complete.");
+          Serial.println();
+        } else {
+          oscState = OSC_TO_TARGET;
+          setTarget(m2, KEY_TARGETS[oscAngleKey], CMD_PWM);
+        }
+      }
+      return;
+  }
+}
+
+// Shared helper for cancelling an in-progress/prompting oscillation.
+void cancelOscillate(const char* reason) {
+  if (oscState != OSC_IDLE) {
+    oscState = OSC_IDLE;
+    Serial.println();
+    Serial.print("Oscillate cancelled: ");
+    Serial.println(reason);
+    Serial.println();
+  }
 }
 
 
@@ -871,8 +991,80 @@ void handleArrow(char arrowCode) {
   }
 }
 
+// s/r/m during an oscillate prompt cancel it the same way they would a
+// normal move (used by both OSC_WAIT_ANGLE and OSC_WAIT_REPS below, so the
+// cancel behavior only has to be written once).
+// Returns true if c was one of those keys and was handled.
+bool oscPromptCancelKey(char c) {
+  if (c == 's' || c == 'S') {
+    cancelOscillate("stopped by user.");
+    resetTargets();
+    return true;
+  }
+
+  if (c == 'r' || c == 'R') {
+    cancelOscillate("reset requested.");
+    imuZero();
+    return true;
+  }
+
+  if (c == 'm' || c == 'M') {
+    menu();
+    return true;
+  }
+
+  return false;
+}
+
 void handleCmd(char c) {
+  // --- Oscillate setup prompts take priority while they're active ---
+
+  if (oscState == OSC_WAIT_ANGLE) {
+    if (c >= '0' && c <= '9') {
+      oscAngleKey = c - '0';
+      oscState = OSC_WAIT_REPS;
+
+      Serial.println();
+      Serial.print("Oscillate target angle: ");
+      Serial.print(KEY_TARGETS[oscAngleKey], 1);
+      Serial.println(" degrees.");
+      Serial.println("Enter number of repetitions (1-9):");
+      Serial.println();
+      return;
+    }
+
+    if (!oscPromptCancelKey(c)) {
+      Serial.println("Please enter a digit 0-9 for the target angle, or press s to cancel.");
+    }
+    return;
+  }
+
+  if (oscState == OSC_WAIT_REPS) {
+    if (c >= '1' && c <= '9') {
+      oscReps = c - '0';
+      oscRepCount = 0;
+
+      Serial.println();
+      Serial.print("Oscillate: running ");
+      Serial.print(oscReps);
+      Serial.println(" repetition(s). Press s or r to stop early.");
+      Serial.println();
+
+      startOscillationRun();
+      return;
+    }
+
+    if (!oscPromptCancelKey(c)) {
+      Serial.println("Please enter a digit 1-9 for repetitions, or press s to cancel.");
+    }
+    return;
+  }
+
+  // --- Normal command handling ---
+
   if (c >= '0' && c <= '9') {
+    cancelOscillate("a direct target was selected.");
+
     int key = c - '0';
     float target = KEY_TARGETS[key];
 
@@ -890,12 +1082,24 @@ void handleCmd(char c) {
     return;
   }
 
+  if (c == 'o' || c == 'O') {
+    stopManual();
+    oscState = OSC_WAIT_ANGLE;
+
+    Serial.println();
+    Serial.println("Oscillate: enter target angle (0-9):");
+    Serial.println();
+    return;
+  }
+
   if (c == 'r' || c == 'R') {
+    cancelOscillate("reset requested.");
     imuZero();
     return;
   }
 
   if (c == 's' || c == 'S') {
+    cancelOscillate("stopped by user.");
     resetTargets();
 
     Serial.println();
@@ -925,10 +1129,6 @@ void printData() {
     float currentDeg = axisVal();
     float errorDeg = manualMode ? 0.0 : errDeg(targetDeg, currentDeg);
 
-
-
-
-
     Serial.print("\nTargetDeg: ");
     Serial.print(targetDeg, 2);
 
@@ -937,6 +1137,13 @@ void printData() {
 
     Serial.print(" | ErrorDeg: ");
     Serial.print(errorDeg, 2);
+
+    if (oscState != OSC_IDLE) {
+      Serial.print(" | Osc rep ");
+      Serial.print(oscRepCount + 1);
+      Serial.print("/");
+      Serial.print(oscReps);
+    }
 
     Serial.print("\nM1Counts: ");
     Serial.print(counts(m1));
