@@ -10,21 +10,20 @@
 #include <utility/imumaths.h>
 
 
-// =========================
+// Adjust Zero angle tolerance: m.zeroTol
+// Adjust lower bound for oscillation:setTarget(m2, 0.0, CMD_PWM);
+// Adjust hold time at oscillation targets: OSC_HOLD_MS
+
+//=========================
 // IMU SETUP
-// =========================
-// Two BNO055s on separate Teensy I2C buses.
-// Upper-arm/base IMU:  Wire
-// Forearm/moving IMU: Wire1
+
 //
 // Joint angle is computed from the zeroed relative quaternion:
 //   qRelRaw   = conjugate(qUpperRaw) * qForearmRaw
 //   qJoint    = conjugate(qRelZero)  * qRelRaw
 //   joint deg = magnitude of qJoint
 //
-// After imuZero(), qUpper, qForearm, qRel, and qJoint all report identity
-// at the zero pose: (1, 0, 0, 0). The raw sensor quaternions are still read
-// from the BNO055s, but the printed/control quaternions are zeroed values.
+
 
 Adafruit_BNO055 bnoUpper(0, 0x28, &Wire);
 Adafruit_BNO055 bnoForearm(1, 0x28, &Wire1);
@@ -202,7 +201,7 @@ int oscReps = 0;       // total repetitions requested
 int oscRepCount = 0;   // repetitions completed so far
 
 unsigned long oscHoldStartMs = 0;
-const unsigned long OSC_HOLD_MS = 3000; // hold time at each end, ms
+const unsigned long OSC_HOLD_MS = 5000; // hold time at each end, ms
 
 
 // =========================
@@ -631,8 +630,13 @@ void pid(Motor& m, float dt, bool enabled) {
 
   float error = errDeg(m.target, axisVal());
   float absErr = fabs(error);
-
+  float tempTol = m.tol;
+  float zeroTol = 10.0;
   // At target: active hold/brake.
+  if (absErr <= zeroTol && m.target == 0.0) {
+    m.tol = zeroTol;
+
+  }
   if (absErr <= m.tol) {
     hold(m);
 
@@ -670,8 +674,9 @@ void pid(Motor& m, float dt, bool enabled) {
       Serial.println();
 
       m.printed = true;
+      
     }
-
+    m.tol = tempTol;
     return;
   }
 
