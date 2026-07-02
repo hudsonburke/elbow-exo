@@ -4,9 +4,9 @@
 #   0-9        send target angle = digit * 10 degrees
 #   left       manual motor reverse
 #   right      manual motor forward
-#   s          stop both motors
-#   r          recalibrate Arduino
-#   m          print Arduino menu
+#   p          pause both motors, same as sending 's' in cpp file
+#   o          oscillation mode
+#   r          recalibrate/zero joint angle
 #   c          clear Python-side stored telemetry
 #   g          reset the joint angle graph
 #   q          quit visualizer

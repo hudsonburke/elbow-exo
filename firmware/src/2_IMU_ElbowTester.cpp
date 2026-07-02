@@ -10,9 +10,15 @@
 #include <utility/imumaths.h>
 
 
-// Adjust Zero angle tolerance: m.zeroTol
-// Adjust lower bound for oscillation:setTarget(m2, 0.0, CMD_PWM);
-// Adjust hold time at oscillation targets: OSC_HOLD_MS
+//IF ADJUSTMENTS ARE NEEDED 
+// - Adjust Zero angle buffer tolerance: zeroTol, line 635, 
+// currently holds motors within 10 deg of 0
+
+// - Adjust lower bound for oscillation: setTarget(m2, 0.0, CMD_PWM), line 880 
+// middle value is lower boud for oscillation
+
+// - Adjust hold time at oscillation targets: OSC_HOLD_MS, line 209
+// currently at 3000 ms
 
 //=========================
 // IMU SETUP
@@ -201,7 +207,7 @@ int oscReps = 0;       // total repetitions requested
 int oscRepCount = 0;   // repetitions completed so far
 
 unsigned long oscHoldStartMs = 0;
-const unsigned long OSC_HOLD_MS = 5000; // hold time at each end, ms
+const unsigned long OSC_HOLD_MS = 3000; // hold time at each end, ms
 
 
 // =========================
