@@ -29,7 +29,7 @@ SERIAL_PORT = "COM8"
 BAUD_RATE = 115200
 
 # Window and layout settings
-WINDOW_SIZE = (14, 8)
+WINDOW_SIZE = (14, 10)
 
 # Increase this number to make the 3D visualizer bigger.
 # Decrease this number to make the 3D visualizer smaller.
@@ -427,11 +427,15 @@ def main():
 
     figure = plt.figure(figsize=WINDOW_SIZE)
 
+    # 3 rows:
+    #   Right top    = joint angle vs time
+    #   Right middle = normalized PWM vs time
+    #   Right bottom = actual PWM vs error
     grid = figure.add_gridspec(
-        2,
+        3,
         2,
         width_ratios=[ARM_PANEL_WIDTH, GRAPH_PANEL_WIDTH],
-        height_ratios=[1.0, 1.0],
+        height_ratios=[1.0, 1.0, 1.0],
         wspace=0.35,
         hspace=0.50
     )
@@ -439,6 +443,7 @@ def main():
     arm_axis = figure.add_subplot(grid[:, 0], projection="3d")
     angle_axis = figure.add_subplot(grid[0, 1])
     pwm_axis = figure.add_subplot(grid[1, 1])
+    pwm_error_axis = figure.add_subplot(grid[2, 1])
 
     figure.subplots_adjust(
         left=0.04,
@@ -450,6 +455,10 @@ def main():
     time_history = deque(maxlen=HISTORY_POINTS)
     angle_history = deque(maxlen=HISTORY_POINTS)
     pwm_norm_history = deque(maxlen=HISTORY_POINTS)
+
+    # Third graph history
+    error_history = deque(maxlen=HISTORY_POINTS)
+    pwm_history = deque(maxlen=HISTORY_POINTS)
 
     start_time = time.monotonic()
 
@@ -527,7 +536,7 @@ def main():
     angle_axis.set_ylim(-180, 180)
     angle_axis.legend(loc="upper right", fontsize=8)
 
-    # PWMNorm graph
+    # PWMNorm vs time graph
     pwm_norm_line, = pwm_axis.plot([], [], linewidth=2, label="PWMNorm")
     pwm_axis.set_title("Normalized PWM Signal", fontsize=11)
     pwm_axis.set_xlabel("Time (s)", fontsize=9)
@@ -535,6 +544,24 @@ def main():
     pwm_axis.grid(True, alpha=0.3)
     pwm_axis.set_ylim(-0.05, 1.05)
     pwm_axis.legend(loc="upper right", fontsize=8)
+
+    # Actual PWM vs error graph
+    pwm_error_line, = pwm_error_axis.plot(
+        [],
+        [],
+        linewidth=2,
+        marker=".",
+        markersize=3,
+        label="PWM vs Error"
+    )
+
+    pwm_error_axis.set_title("Actual PWM vs Error e(t)", fontsize=11)
+    pwm_error_axis.set_xlabel("Error e(t) (deg)", fontsize=9)
+    pwm_error_axis.set_ylabel("PWM value", fontsize=9)
+    pwm_error_axis.grid(True, alpha=0.3)
+    pwm_error_axis.set_xlim(-1.0, 1.0)
+    pwm_error_axis.set_ylim(-5, 260)
+    pwm_error_axis.legend(loc="upper right", fontsize=8)
 
     status_text = figure.text(
         0.02,
@@ -552,6 +579,8 @@ def main():
         time_history.clear()
         angle_history.clear()
         pwm_norm_history.clear()
+        error_history.clear()
+        pwm_history.clear()
 
         start_time = time.monotonic()
 
@@ -562,6 +591,10 @@ def main():
         pwm_norm_line.set_data([], [])
         pwm_axis.set_xlim(0.0, 1.0)
         pwm_axis.set_ylim(-0.05, 1.05)
+
+        pwm_error_line.set_data([], [])
+        pwm_error_axis.set_xlim(-1.0, 1.0)
+        pwm_error_axis.set_ylim(-5, 260)
 
     def handle_key_press(event):
         """Send keyboard commands to the Teensy/Arduino."""
@@ -577,7 +610,7 @@ def main():
         elif event.key == "r":
             send_serial_command("r")
 
-        elif event.key == "p":
+        elif event.key == "space":
             send_serial_command("s")
 
         elif event.key == "m":
@@ -646,6 +679,9 @@ def main():
         angle_history.append(joint_angle)
         pwm_norm_history.append(telemetry["pwm_norm"])
 
+        error_history.append(telemetry["error_angle"])
+        pwm_history.append(telemetry["pwm"])
+
         # Update joint angle graph
         angle_line.set_data(list(time_history), list(angle_history))
 
@@ -664,7 +700,7 @@ def main():
 
             angle_axis.set_ylim(min_angle, max_angle)
 
-        # Update PWMNorm graph
+        # Update PWMNorm vs time graph
         pwm_norm_line.set_data(list(time_history), list(pwm_norm_history))
 
         if pwm_norm_history:
@@ -673,6 +709,20 @@ def main():
 
             pwm_axis.set_xlim(left_time, right_time)
             pwm_axis.set_ylim(-0.05, 1.05)
+
+        # Update actual PWM vs error graph
+        pwm_error_line.set_data(list(error_history), list(pwm_history))
+
+        if error_history:
+            min_error = min(error_history) - 2.0
+            max_error = max(error_history) + 2.0
+
+            if abs(max_error - min_error) < 1.0:
+                min_error -= 1.0
+                max_error += 1.0
+
+            pwm_error_axis.set_xlim(min_error, max_error)
+            pwm_error_axis.set_ylim(-5, 260)
 
         status_lines = [
             "Keys: 0-9 target | left/right manual | p pause | r recalibrate | m menu | c clear | g reset graphs | q quit",
@@ -699,6 +749,7 @@ def main():
             forearm_line,
             angle_line,
             pwm_norm_line,
+            pwm_error_line,
             status_text,
         )
 

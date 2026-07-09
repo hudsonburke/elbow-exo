@@ -7,33 +7,17 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
-// ======================================================
-// Two-BNO055 IMU + Motor 2 PID Control + PWMNorm Output
-// ======================================================
-//
-// Keyboard commands through Python visualizer:
-//   0-9        target angle = digit * 10 degrees
-//   left       manual motor reverse
-//   right      manual motor forward
-//   p or s     stop motor
-//   r          recalibrate / zero IMUs
-//   m          print menu
-//
-// Important:
-//   Keep only this file active in src/main.cpp.
-//   Do not keep another .cpp with setup() and loop() in src.
+// Dual BNO055 IMU + Motor 2 PID Control
+// IMU spike rejection + low-pass filtering
 
-// =====================
+
+// ---------------------
 // IMU setup
-// =====================
+// ---------------------
 
-// Upper arm IMU on Wire
 Adafruit_BNO055 bnoUpper(0, 0x28, &Wire);
-
-// Forearm IMU on Wire1
 Adafruit_BNO055 bnoForearm(1, 0x28, &Wire1);
 
-// Simple quaternion struct so we do not depend too much on imu::Quaternion math.
 struct Quat {
   float w;
   float x;
@@ -41,30 +25,49 @@ struct Quat {
   float z;
 };
 
-Quat qUpperRaw     = {1.0, 0.0, 0.0, 0.0};
-Quat qForearmRaw   = {1.0, 0.0, 0.0, 0.0};
+Quat qUpRaw = {1.0, 0.0, 0.0, 0.0};
+Quat qForeRaw = {1.0, 0.0, 0.0, 0.0};
 
-Quat qUpperZero    = {1.0, 0.0, 0.0, 0.0};
-Quat qForearmZero  = {1.0, 0.0, 0.0, 0.0};
+Quat qUpZero = {1.0, 0.0, 0.0, 0.0};
+Quat qForeZero = {1.0, 0.0, 0.0, 0.0};
 
-Quat qUpperZeroed   = {1.0, 0.0, 0.0, 0.0};
-Quat qForearmZeroed = {1.0, 0.0, 0.0, 0.0};
-Quat qJointZeroed   = {1.0, 0.0, 0.0, 0.0};
+Quat qUpZeroed = {1.0, 0.0, 0.0, 0.0};
+Quat qForeZeroed = {1.0, 0.0, 0.0, 0.0};
+Quat qJointZeroed = {1.0, 0.0, 0.0, 0.0};
 
-float jointAngleDeg = 0.0;
+float ang = 0.0;
+float rawAng = 0.0;
+
 bool imuOk = false;
 
-// =====================
-// Motor pins
-// =====================
+// ---------------------
+// IMU filter
+// ---------------------
 
-// Motor 1 pins
+float filtAng = 0.0;
+float avgAng = 0.0;
+float varAng = 0.0;
+float goodAng = 0.0;
+
+bool filtOn = false;
+unsigned long rejSpks = 0;
+
+const float FILT_A = 0.25;
+const float AVG_A = 0.10;
+const float VAR_A = 0.10;
+
+const float JMP_MAX = 25.0;
+const float VAR_MAX = 100.0;
+
+// ---------------------
+// Motor pins
+// ---------------------
+
 const int M1_IN1 = 4;
 const int M1_IN2 = 5;
 const int M1_ENC_A = 30;
 const int M1_ENC_B = 31;
 
-// Motor 2 pins
 const int M2_IN1 = 2;
 const int M2_IN2 = 3;
 const int M2_ENC_A = 28;
@@ -73,9 +76,9 @@ const int M2_ENC_B = 29;
 Encoder enc1(M1_ENC_A, M1_ENC_B);
 Encoder enc2(M2_ENC_A, M2_ENC_B);
 
-// =====================
-// General constants
-// =====================
+// ---------------------
+// Constants
+// ---------------------
 
 const int FWD = 1;
 const int REV = -1;
@@ -86,26 +89,34 @@ const int M2_ENC_SIGN = 1;
 const int M1_MOT_SIGN = 1;
 const int M2_MOT_SIGN = 1;
 
-// If roll direction is backwards, flip these.
-const int M1_ROLL_SIGN = 1;
-const int M2_ROLL_SIGN = -1;
+const int MAN_PWM = 125;
 
-// Manual test speed
-const int Man_speed = 125;
+const unsigned long CTRL_US = 10000;
+const unsigned long PRINT_MS = 200;
 
-// Control timing
-const unsigned long CTRL_US = 10000;   // 10 ms control loop
-const unsigned long PRINT_MS = 200;    // print every 200 ms
-
-// Keyboard targets
-const float KEY_TARGETS[10] = {
-  0.0, 10.0, 20.0, 30.0, 40.0,
+const float KEY_TGTS[10] = {
+  5.0, 10.0, 20.0, 30.0, 40.0,
   50.0, 60.0, 70.0, 80.0, 90.0
 };
 
-// =====================
+// ---------------------
+// Oscillation settings
+// ---------------------
+
+bool oscOn = false;
+bool oscWait = false;
+
+int oscPhase = 0;
+int oscDone = 0;
+
+const int OSC_CYCLES = 5;
+const unsigned long OSC_WAIT_MS = 2000;
+
+unsigned long oscStartMs = 0;
+
+// ---------------------
 // Motor struct
-// =====================
+// ---------------------
 
 struct Motor {
   const char* name;
@@ -116,37 +127,26 @@ struct Motor {
 
   int encSign;
   int motSign;
-  int rollSign;
 
-  // PID gains
   float kp;
   float kd;
   float ki;
-
-  // uFull is the PID output magnitude that equals full normalized command.
-  // Smaller uFull = reaches max PWM faster.
-  // Larger uFull = smoother/weaker response.
   float uFull;
 
-  // PWM limits
   int minPwm;
   int maxPwm;
   int slowPwm;
 
-  // Angle control settings
   float tol;
   float slowZone;
   unsigned long timeout;
 
-  // PID state
   float target;
   float lastErr;
   float sumErr;
   float lastMeas;
-  float dErrFilt;
   float lastOut;
 
-  // Values for visualizer
   float lastUNorm;
   int lastPwm;
 
@@ -157,108 +157,65 @@ struct Motor {
   unsigned long startMs;
 };
 
-// Motor 1 exists, but right now it is disabled in motorEnabled().
 Motor m1 = {
   "M1",
-
   M1_IN1, M1_IN2, &enc1,
+  M1_ENC_SIGN, M1_MOT_SIGN,
 
-  M1_ENC_SIGN,
-  M1_MOT_SIGN,
-  M1_ROLL_SIGN,
+  1.75, 0.0, 0.05,
+  20.0,
 
-  // kp, kd, ki
-  1.75, 0.0, 0.125,
+  150, 255, 150,
+  1.0, 10.0, 15000,
 
-  // uFull
-  100.0,
-
-  // minPwm, maxPwm, slowPwm
-  150, 225, 150,
-
-  // tol, slowZone, timeout
-  1.0, 5.0, 10000,
-
-  // target, lastErr, sumErr
-  0.0, 0.0, 0.0,
-
-  // lastMeas, dErrFilt, lastOut
-  0.0, 0.0, 0.0,
-
-  // lastUNorm, lastPwm
+  0.0, 0.0, 0.0, 0.0, 0.0,
   0.0, 0,
 
-  // active, holding, printed
   false, false, false,
-
-  // startMs
   0
 };
 
-// Motor 2 is the active motor.
 Motor m2 = {
   "M2",
-
   M2_IN1, M2_IN2, &enc2,
+  M2_ENC_SIGN, M2_MOT_SIGN,
 
-  M2_ENC_SIGN,
-  M2_MOT_SIGN,
-  M2_ROLL_SIGN,
+  1.75, 0.0, 0.05,
+  20.0,
 
-  // kp, kd, ki
-  1.75, 0.0, 0.125,
+  150, 255, 150,
+  1.0, 5.0, 15000,
 
-  // uFull
-  100.0,
-
-  // minPwm, maxPwm, slowPwm
-  150, 225, 150,
-
-  // tol, slowZone, timeout
-  1.0, 5.0, 10000,
-
-  // target, lastErr, sumErr
-  0.0, 0.0, 0.0,
-
-  // lastMeas, dErrFilt, lastOut
-  0.0, 0.0, 0.0,
-
-  // lastUNorm, lastPwm
+  0.0, 0.0, 0.0, 0.0, 0.0,
   0.0, 0,
 
-  // active, holding, printed
   false, false, false,
-
-  // startMs
   0
 };
 
-// =====================
-// Manual mode state
-// =====================
+// ---------------------
+// Runtime state
+// ---------------------
 
-bool manualMode = false;
-int manualDir = 0;
-
-// Used to detect escape sequences from arrow keys.
+bool manMode = false;
+int manDir = 0;
 int escState = 0;
-
-// =====================
-// Timing state
-// =====================
 
 unsigned long lastCtrlUs = 0;
 unsigned long lastPrintMs = 0;
 
-// =====================
-// Function declarations
-// =====================
 
-Quat normalizeQuat(Quat q);
-Quat quatConjugate(Quat q);
-Quat quatMultiply(Quat a, Quat b);
-Quat quatFromBNO(imu::Quaternion q);
-float quatAngleDeg(Quat q);
+// Function declarations
+
+
+Quat normQ(Quat q);
+Quat conjQ(Quat q);
+Quat mulQ(Quat a, Quat b);
+Quat fromBno(imu::Quaternion q);
+float angleQ(Quat q);
+
+float filtJoint(float raw);
+void resetFilt(float start);
 
 bool imuStart();
 bool imuReady();
@@ -266,9 +223,7 @@ void imuRead();
 void imuZero();
 
 float axisVal();
-float axisRaw();
 float errDeg(float target, float current);
-float angDiff(float target, float current);
 
 long counts(Motor& m);
 
@@ -284,19 +239,24 @@ void resetMotor(Motor& m);
 void resetTargets();
 void setTarget(float deg);
 
+void startOsc();
+void stopOsc();
+void updateOsc();
+
 void serialCheck();
 void handleChar(char c);
 void handleArrow(char c);
 
 void updateAll();
+void printQuat(const char* label, Quat q);
 void printData();
 void menu();
 
-// =====================
-// Quaternion math
-// =====================
 
-Quat normalizeQuat(Quat q) {
+// Quaternion math
+
+
+Quat normQ(Quat q) {
   float n = sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
 
   if (n < 0.000001) {
@@ -311,18 +271,12 @@ Quat normalizeQuat(Quat q) {
   return q;
 }
 
-Quat quatConjugate(Quat q) {
-  q = normalizeQuat(q);
-
-  return {
-    q.w,
-    -q.x,
-    -q.y,
-    -q.z
-  };
+Quat conjQ(Quat q) {
+  q = normQ(q);
+  return {q.w, -q.x, -q.y, -q.z};
 }
 
-Quat quatMultiply(Quat a, Quat b) {
+Quat mulQ(Quat a, Quat b) {
   Quat q;
 
   q.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
@@ -330,10 +284,10 @@ Quat quatMultiply(Quat a, Quat b) {
   q.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
   q.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
 
-  return normalizeQuat(q);
+  return normQ(q);
 }
 
-Quat quatFromBNO(imu::Quaternion q) {
+Quat fromBno(imu::Quaternion q) {
   Quat out = {
     (float)q.w(),
     (float)q.x(),
@@ -341,11 +295,11 @@ Quat quatFromBNO(imu::Quaternion q) {
     (float)q.z()
   };
 
-  return normalizeQuat(out);
+  return normQ(out);
 }
 
-float quatAngleDeg(Quat q) {
-  q = normalizeQuat(q);
+float angleQ(Quat q) {
+  q = normQ(q);
 
   float w = fabs(q.w);
   w = constrain(w, -1.0, 1.0);
@@ -353,9 +307,60 @@ float quatAngleDeg(Quat q) {
   return 2.0 * acos(w) * 180.0 / PI;
 }
 
-// =====================
+
+// IMU filter
+
+
+float filtJoint(float raw) {
+  if (!filtOn) {
+    resetFilt(raw);
+    return raw;
+  }
+
+  float jump = fabs(raw - filtAng);
+  float dAvg = raw - avgAng;
+  float instVar = dAvg * dAvg;
+
+  float vLim = varAng * 3.0;
+
+  if (vLim < VAR_MAX) {
+    vLim = VAR_MAX;
+  }
+
+  bool spike = (jump > JMP_MAX) && (instVar > vLim);
+
+  if (spike) {
+    rejSpks++;
+    filtAng = goodAng;
+    return filtAng;
+  }
+
+  avgAng = AVG_A * raw + (1.0 - AVG_A) * avgAng;
+
+  float dNew = raw - avgAng;
+  float newVar = dNew * dNew;
+
+  varAng = VAR_A * newVar + (1.0 - VAR_A) * varAng;
+
+  filtAng = FILT_A * raw + (1.0 - FILT_A) * filtAng;
+  goodAng = filtAng;
+
+  return filtAng;
+}
+
+void resetFilt(float start) {
+  rawAng = start;
+  filtAng = start;
+  avgAng = start;
+  varAng = 0.0;
+  goodAng = start;
+  filtOn = true;
+  rejSpks = 0;
+}
+
+
 // IMU functions
-// =====================
+
 
 bool imuStart() {
   Wire.begin();
@@ -363,18 +368,18 @@ bool imuStart() {
 
   delay(100);
 
-  bool upperOk = bnoUpper.begin();
-  bool forearmOk = bnoForearm.begin();
+  bool upOk = bnoUpper.begin();
+  bool foreOk = bnoForearm.begin();
 
-  if (!upperOk) {
+  if (!upOk) {
     Serial.println("ERROR: Upper BNO055 not detected.");
   }
 
-  if (!forearmOk) {
+  if (!foreOk) {
     Serial.println("ERROR: Forearm BNO055 not detected.");
   }
 
-  if (!upperOk || !forearmOk) {
+  if (!upOk || !foreOk) {
     imuOk = false;
     return false;
   }
@@ -403,20 +408,16 @@ void imuRead() {
     return;
   }
 
-  qUpperRaw = quatFromBNO(bnoUpper.getQuat());
-  qForearmRaw = quatFromBNO(bnoForearm.getQuat());
+  qUpRaw = fromBno(bnoUpper.getQuat());
+  qForeRaw = fromBno(bnoForearm.getQuat());
 
-  // Zeroed orientation:
-  // qZeroed = conjugate(qZero) * qCurrent
-  qUpperZeroed = quatMultiply(quatConjugate(qUpperZero), qUpperRaw);
-  qForearmZeroed = quatMultiply(quatConjugate(qForearmZero), qForearmRaw);
+  qUpZeroed = mulQ(conjQ(qUpZero), qUpRaw);
+  qForeZeroed = mulQ(conjQ(qForeZero), qForeRaw);
 
-  // Relative joint quaternion:
-  // qJoint = conjugate(qUpperZeroed) * qForearmZeroed
-  qJointZeroed = quatMultiply(quatConjugate(qUpperZeroed), qForearmZeroed);
+  qJointZeroed = mulQ(conjQ(qUpZeroed), qForeZeroed);
 
-  // Joint angle magnitude in degrees.
-  jointAngleDeg = quatAngleDeg(qJointZeroed);
+  rawAng = angleQ(qJointZeroed);
+  ang = filtJoint(rawAng);
 }
 
 void imuZero() {
@@ -425,49 +426,40 @@ void imuZero() {
     return;
   }
 
-  qUpperRaw = quatFromBNO(bnoUpper.getQuat());
-  qForearmRaw = quatFromBNO(bnoForearm.getQuat());
+  qUpRaw = fromBno(bnoUpper.getQuat());
+  qForeRaw = fromBno(bnoForearm.getQuat());
 
-  qUpperZero = qUpperRaw;
-  qForearmZero = qForearmRaw;
+  qUpZero = qUpRaw;
+  qForeZero = qForeRaw;
 
-  qUpperZeroed = {1.0, 0.0, 0.0, 0.0};
-  qForearmZeroed = {1.0, 0.0, 0.0, 0.0};
+  qUpZeroed = {1.0, 0.0, 0.0, 0.0};
+  qForeZeroed = {1.0, 0.0, 0.0, 0.0};
   qJointZeroed = {1.0, 0.0, 0.0, 0.0};
 
-  jointAngleDeg = 0.0;
+  rawAng = 0.0;
+  ang = 0.0;
 
+  resetFilt(0.0);
   resetTargets();
 
   Serial.println("IMU recalibrated. Current joint angle is now 0.");
 }
 
-// =====================
+
 // Angle helpers
-// =====================
+
 
 float axisVal() {
-  // Right now the control angle is the relative joint angle.
-  return jointAngleDeg;
-}
-
-float axisRaw() {
-  return jointAngleDeg;
-}
-
-float angDiff(float target, float current) {
-  // For this elbow angle, we are using normal subtraction.
-  // If later you use yaw from 0-360, then wrapping may be needed.
-  return target - current;
+  return ang;
 }
 
 float errDeg(float target, float current) {
-  return angDiff(target, current);
+  return target - current;
 }
 
-// =====================
+
 // Motor helpers
-// =====================
+
 
 long counts(Motor& m) {
   return m.encSign * m.enc->read();
@@ -496,8 +488,6 @@ void off(Motor& m) {
 }
 
 void hold(Motor& m) {
-  // Brake/hold by driving both inputs high.
-  // This is separate from active PID drive.
   analogWrite(m.in1, 255);
   analogWrite(m.in2, 255);
 }
@@ -514,9 +504,9 @@ float sat1(float x) {
   return x;
 }
 
-// =====================
+
 // PID controller
-// =====================
+
 
 void pid(Motor& m, float dt, bool enabled) {
   if (!imuReady() || !enabled) {
@@ -536,25 +526,26 @@ void pid(Motor& m, float dt, bool enabled) {
   float error = errDeg(m.target, current);
   float absErr = fabs(error);
 
-  // Hysteresis:
-  // Enter hold at m.tol.
-  // Leave hold only when error grows larger than 1.5 * m.tol.
+  bool errFlip =
+      (error > 0.0 && m.lastErr < 0.0) ||
+      (error < 0.0 && m.lastErr > 0.0);
+
+  if (errFlip) {
+    m.sumErr = 0.0;
+  }
+
   float exitTol = m.tol * 1.5;
   bool atTarget = m.holding ? (absErr <= exitTol) : (absErr <= m.tol);
 
   if (atTarget) {
     hold(m);
 
-    // For the visualizer:
-    // This means active PID drive is 0 while we are holding.
-    // The driver is braking, but PID is not commanding forward/reverse motion.
     m.lastUNorm = 0.0;
     m.lastPwm = 0;
 
     m.sumErr = 0.0;
     m.lastErr = error;
     m.lastMeas = current;
-    m.dErrFilt = 0.0;
     m.lastOut = 0.0;
 
     m.holding = true;
@@ -569,7 +560,6 @@ void pid(Motor& m, float dt, bool enabled) {
     return;
   }
 
-  // If we were holding and got pushed away, restart PID cleanly.
   if (m.holding) {
     m.holding = false;
     m.printed = false;
@@ -577,7 +567,6 @@ void pid(Motor& m, float dt, bool enabled) {
     m.sumErr = 0.0;
     m.lastErr = error;
     m.lastMeas = current;
-    m.dErrFilt = 0.0;
     m.lastOut = 0.0;
     m.startMs = millis();
 
@@ -585,7 +574,6 @@ void pid(Motor& m, float dt, bool enabled) {
     Serial.println(" moved away from target. PID re-engaging.");
   }
 
-  // Timeout protection
   if (millis() - m.startMs > m.timeout) {
     Serial.print(m.name);
     Serial.println(" timeout. Motor stopped.");
@@ -595,33 +583,23 @@ void pid(Motor& m, float dt, bool enabled) {
     return;
   }
 
-  // Slow zone limits the max PWM near the target.
   int pwmLimit = m.maxPwm;
 
   if (absErr <= m.slowZone) {
     pwmLimit = m.slowPwm;
   }
 
-  // Derivative on measurement:
-  // This avoids a derivative kick when target changes.
   float dMeas = (current - m.lastMeas) / dt;
-  float dErrRaw = -dMeas;
+  float dErr = -dMeas;
 
-  // Low-pass filter on derivative.
-  m.dErrFilt = 0.2 * dErrRaw + 0.8 * m.dErrFilt;
-  float dErr = m.dErrFilt;
-
-  // Conditional integration anti-windup.
-  // If output is already saturated and error is pushing farther into saturation,
-  // do not keep growing the integral.
-  bool saturated = (fabs(m.lastOut) >= fabs(m.uFull)) &&
-                   ((m.lastOut > 0.0) == (error > 0.0));
+  bool saturated =
+      (fabs(m.lastOut) >= fabs(m.uFull)) &&
+      ((m.lastOut > 0.0) == (error > 0.0));
 
   if (!saturated) {
     m.sumErr += error * dt;
   }
 
-  // Integral clamp based on uFull and ki.
   if (fabs(m.ki) > 0.000001) {
     float iLimit = fabs(m.uFull / m.ki);
     m.sumErr = constrain(m.sumErr, -iLimit, iLimit);
@@ -629,67 +607,48 @@ void pid(Motor& m, float dt, bool enabled) {
     m.sumErr = 0.0;
   }
 
-  // PID output before PWM conversion.
-  float out = m.kp * error + m.kd * dErr + m.ki * m.sumErr;
+  float out =
+      m.kp * error +
+      m.kd * dErr +
+      m.ki * m.sumErr;
 
   m.lastErr = error;
   m.lastMeas = current;
   m.lastOut = out;
 
-  // ===============================
-  // Normalized PWM mapping
-  // ===============================
-  //
-  // uNorm = sat1(abs(uPID) / uFull)
-  //
-  // PWM = PWMmin + (PWMmax - PWMmin) * uNorm
-  //
-  // uNorm is what we graph in Python.
-  // It is between 0.0 and 1.0.
+  float uFull = fabs(m.uFull);
 
-  float uPID = out;
-
-  float uFullNow = fabs(m.uFull);
-
-  if (uFullNow < 0.000001) {
-    uFullNow = 1.0;
+  if (uFull < 0.000001) {
+    uFull = 1.0;
   }
 
-  float uNorm = sat1(fabs(uPID) / uFullNow);
+  float uNorm = sat1(fabs(out) / uFull);
 
-  int pwmMaxNow = pwmLimit;
-  int pwmMinNow = min(m.minPwm, pwmMaxNow);
+  int pwmMin = min(m.minPwm, pwmLimit);
+  int pwm = pwmMin + (int)((pwmLimit - pwmMin) * uNorm);
 
-  int pwm = pwmMinNow + (int)((pwmMaxNow - pwmMinNow) * uNorm);
-
-  if (fabs(uPID) < 0.0001) {
+  if (fabs(out) < 0.0001) {
     pwm = 0;
     uNorm = 0.0;
   }
 
-  // Store values so printData() can send them to the visualizer.
   m.lastUNorm = uNorm;
   m.lastPwm = pwm;
 
-  int dir = (uPID >= 0.0) ? FWD : REV;
+  int dir = (out >= 0.0) ? FWD : REV;
 
-  // Apply motor direction sign.
-  dir *= m.motSign;
-
-  drive(m, dir, pwm);
+  drive(m, dir * m.motSign, pwm);
 }
 
-// =====================
-// Target and reset functions
-// =====================
+
+// Target, reset, and oscillation
+
 
 bool motorEnabled(Motor& m) {
-  // Motor 1 is disabled for now.
   if (&m == &m1) {
     return false;
   }
 
-  // Motor 2 controls the elbow joint.
   if (&m == &m2) {
     return true;
   }
@@ -702,10 +661,9 @@ void resetMotor(Motor& m) {
   m.holding = false;
   m.printed = false;
 
-  m.sumErr = 0.0;
   m.lastErr = 0.0;
+  m.sumErr = 0.0;
   m.lastMeas = axisVal();
-  m.dErrFilt = 0.0;
   m.lastOut = 0.0;
 
   m.lastUNorm = 0.0;
@@ -713,22 +671,24 @@ void resetMotor(Motor& m) {
 }
 
 void resetTargets() {
+  stopOsc();
+
   resetMotor(m1);
   resetMotor(m2);
 
   m1.target = axisVal();
   m2.target = axisVal();
 
-  manualMode = false;
-  manualDir = 0;
+  manMode = false;
+  manDir = 0;
 
   off(m1);
   off(m2);
 }
 
 void setTarget(float deg) {
-  manualMode = false;
-  manualDir = 0;
+  manMode = false;
+  manDir = 0;
 
   float current = axisVal();
 
@@ -737,10 +697,9 @@ void setTarget(float deg) {
   m2.holding = false;
   m2.printed = false;
 
-  m2.sumErr = 0.0;
   m2.lastErr = errDeg(m2.target, current);
+  m2.sumErr = 0.0;
   m2.lastMeas = current;
-  m2.dErrFilt = 0.0;
   m2.lastOut = 0.0;
   m2.lastUNorm = 0.0;
   m2.lastPwm = 0;
@@ -751,17 +710,79 @@ void setTarget(float deg) {
   Serial.println(" deg");
 }
 
-// =====================
-// Serial command handling
-// =====================
+void startOsc() {
+  manMode = false;
+  manDir = 0;
+
+  oscOn = true;
+  oscWait = false;
+  oscPhase = 0;
+  oscDone = 0;
+  oscStartMs = 0;
+
+  Serial.println("Oscillation started.");
+
+  setTarget(KEY_TGTS[0]);
+}
+
+void stopOsc() {
+  oscOn = false;
+  oscWait = false;
+  oscPhase = 0;
+  oscDone = 0;
+  oscStartMs = 0;
+}
+
+void updateOsc() {
+  if (!oscOn || manMode) {
+    return;
+  }
+
+  if (!m2.holding) {
+    oscWait = false;
+    return;
+  }
+
+  if (!oscWait) {
+    oscWait = true;
+    oscStartMs = millis();
+    return;
+  }
+
+  if (millis() - oscStartMs < OSC_WAIT_MS) {
+    return;
+  }
+
+  oscWait = false;
+
+  if (oscPhase == 0) {
+    oscPhase = 1;
+    setTarget(KEY_TGTS[9]);
+  } else if (oscPhase == 1) {
+    oscPhase = 2;
+    setTarget(KEY_TGTS[0]);
+  } else if (oscPhase == 2) {
+    oscDone++;
+
+    if (oscDone >= OSC_CYCLES) {
+      stopOsc();
+      Serial.println("Oscillation finished.");
+      return;
+    }
+
+    oscPhase = 1;
+    setTarget(KEY_TGTS[9]);
+  }
+}
+
+
+// Serial commands
+
 
 void serialCheck() {
   while (Serial.available() > 0) {
     char c = Serial.read();
 
-    // Handle arrow key escape sequence:
-    // left  = ESC [ D
-    // right = ESC [ C
     if (escState == 0) {
       if (c == 27) {
         escState = 1;
@@ -769,11 +790,7 @@ void serialCheck() {
         handleChar(c);
       }
     } else if (escState == 1) {
-      if (c == '[') {
-        escState = 2;
-      } else {
-        escState = 0;
-      }
+      escState = (c == '[') ? 2 : 0;
     } else if (escState == 2) {
       handleArrow(c);
       escState = 0;
@@ -787,24 +804,27 @@ void handleChar(char c) {
   }
 
   if (isdigit(c)) {
+    stopOsc();
+
     int digit = c - '0';
-    setTarget(KEY_TARGETS[digit]);
+    setTarget(KEY_TGTS[digit]);
+    return;
+  }
+
+  if (c == 'x' || c == 'X') {
+    startOsc();
     return;
   }
 
   if (c == 's' || c == 'p') {
     Serial.println("Stop command received.");
-
-    manualMode = false;
-    manualDir = 0;
-
     resetTargets();
-
     return;
   }
 
   if (c == 'r') {
     Serial.println("Recalibrating IMUs...");
+    resetTargets();
     imuZero();
     return;
   }
@@ -819,10 +839,11 @@ void handleChar(char c) {
 }
 
 void handleArrow(char c) {
+  stopOsc();
+
   if (c == 'D') {
-    // Left arrow = manual reverse
-    manualMode = true;
-    manualDir = REV;
+    manMode = true;
+    manDir = REV;
 
     m2.active = false;
     m2.holding = false;
@@ -830,9 +851,8 @@ void handleArrow(char c) {
 
     Serial.println("Manual mode: Motor 2 reverse");
   } else if (c == 'C') {
-    // Right arrow = manual forward
-    manualMode = true;
-    manualDir = FWD;
+    manMode = true;
+    manDir = FWD;
 
     m2.active = false;
     m2.holding = false;
@@ -842,9 +862,9 @@ void handleArrow(char c) {
   }
 }
 
-// =====================
-// Main update function
-// =====================
+
+// Main update
+
 
 void updateAll() {
   serialCheck();
@@ -856,33 +876,27 @@ void updateAll() {
   }
 
   float dt = (nowUs - lastCtrlUs) / 1000000.0;
-
   lastCtrlUs = nowUs;
 
   if (dt <= 0.0) {
     dt = CTRL_US / 1000000.0;
   }
 
-  // Prevent a huge dt from messing up derivative if the loop pauses.
   if (dt > 0.05) {
     dt = 0.05;
   }
 
   imuRead();
 
-  static bool wasManual = false;
+  static bool wasMan = false;
 
-  if (manualMode) {
+  if (manMode) {
     off(m1);
 
-    int manualPwm = Man_speed;
+    drive(m2, manDir * m2.motSign, MAN_PWM);
 
-    drive(m2, manualDir * m2.motSign, manualPwm);
-
-    // This is the important fix:
-    // Store manual PWM so the visualizer does not stay at 0.
-    m2.lastPwm = manualPwm;
-    m2.lastUNorm = (float)manualPwm / (float)m2.maxPwm;
+    m2.lastPwm = MAN_PWM;
+    m2.lastUNorm = (float)MAN_PWM / (float)m2.maxPwm;
 
     if (m2.lastUNorm > 1.0) {
       m2.lastUNorm = 1.0;
@@ -890,18 +904,16 @@ void updateAll() {
 
     printData();
 
-    wasManual = true;
+    wasMan = true;
     return;
   }
 
-  // Bumpless transfer from manual mode back to PID mode.
-  if (wasManual) {
+  if (wasMan) {
     float current = axisVal();
 
-    m2.sumErr = 0.0;
     m2.lastErr = errDeg(m2.target, current);
+    m2.sumErr = 0.0;
     m2.lastMeas = current;
-    m2.dErrFilt = 0.0;
     m2.lastOut = 0.0;
     m2.lastUNorm = 0.0;
     m2.lastPwm = 0;
@@ -909,18 +921,20 @@ void updateAll() {
     m2.printed = false;
     m2.startMs = millis();
 
-    wasManual = false;
+    wasMan = false;
   }
 
   pid(m1, dt, motorEnabled(m1));
   pid(m2, dt, motorEnabled(m2));
 
+  updateOsc();
+
   printData();
 }
 
-// =====================
-// Printing for visualizer
-// =====================
+
+// Printing
+
 
 void printQuat(const char* label, Quat q) {
   Serial.print(label);
@@ -941,15 +955,21 @@ void printData() {
 
   lastPrintMs = millis();
 
-  float targetDeg = manualMode ? axisVal() : m2.target;
+  float targetDeg = manMode ? axisVal() : m2.target;
   float currentDeg = axisVal();
-  float errorDeg = manualMode ? 0.0 : errDeg(targetDeg, currentDeg);
+  float errorDeg = manMode ? 0.0 : errDeg(targetDeg, currentDeg);
 
   Serial.print("\nTargetDeg: ");
   Serial.print(targetDeg, 2);
 
   Serial.print(" | CurrentDeg: ");
   Serial.print(currentDeg, 2);
+
+  Serial.print(" | RawDeg: ");
+  Serial.print(rawAng, 2);
+
+  Serial.print(" | RejectedSpikes: ");
+  Serial.print(rejSpks);
 
   Serial.print(" | ErrorDeg: ");
   Serial.print(errorDeg, 2);
@@ -962,8 +982,10 @@ void printData() {
 
   Serial.print(" | Mode: ");
 
-  if (manualMode) {
+  if (manMode) {
     Serial.print("Manual");
+  } else if (oscOn) {
+    Serial.print("Osc");
   } else if (m2.active) {
     Serial.print("PID");
   } else {
@@ -976,19 +998,30 @@ void printData() {
   Serial.print(" | M2Counts: ");
   Serial.println(counts(m2));
 
-  printQuat("qUpperZeroed", qUpperZeroed);
-  printQuat("qForearmZeroed", qForearmZeroed);
+  printQuat("qUpperZeroed", qUpZeroed);
+  printQuat("qForearmZeroed", qForeZeroed);
   printQuat("qJointZeroed", qJointZeroed);
 }
 
-// =====================
+
 // Menu
-// =====================
+
 
 void menu() {
   Serial.println();
   Serial.println("========== MENU ==========");
-  Serial.println("0-9  : Move Motor 2 to digit * 10 degrees");
+  Serial.println("0-9  : Move Motor 2 to selected target");
+  Serial.println("0 = 5 deg");
+  Serial.println("1 = 10 deg");
+  Serial.println("2 = 20 deg");
+  Serial.println("3 = 30 deg");
+  Serial.println("4 = 40 deg");
+  Serial.println("5 = 50 deg");
+  Serial.println("6 = 60 deg");
+  Serial.println("7 = 70 deg");
+  Serial.println("8 = 80 deg");
+  Serial.println("9 = 90 deg");
+  Serial.println("x    : Oscillate between key 0 and key 9 targets");
   Serial.println("Left : Manual Motor 2 reverse");
   Serial.println("Right: Manual Motor 2 forward");
   Serial.println("s/p  : Stop motor");
@@ -998,9 +1031,9 @@ void menu() {
   Serial.println();
 }
 
-// =====================
+
 // Setup and loop
-// =====================
+
 
 void setup() {
   Serial.begin(115200);
