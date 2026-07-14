@@ -27,14 +27,17 @@ import serial
 # Configuration
 # =====================
 
-SERIAL_PORT = "COM8"
+SERIAL_PORT = "COM9"
 BAUD_RATE = 9600
 
-# Segment distances in meters. Tune these to match your actual mounting.
-SHOULDER_TO_UPPER_IMU = 1
-UPPER_IMU_TO_ELBOW = 5.25
-ELBOW_TO_FOREARM_IMU = 3
-FOREARM_IMU_TO_HAND = 1
+# Segment distances. These values appear to be inches in the current setup.
+SHOULDER_TO_UPPER_IMU = 5
+UPPER_IMU_TO_ELBOW = 5
+ELBOW_TO_FOREARM_IMU = 7
+FOREARM_IMU_TO_HAND = 4
+
+# The IMU-reported joint angle is zero at a physical elbow angle of _ degrees.
+THETA0_DEG = 15.0
 
 # Tracking axis: your testing showed the IMU/arm motion behaves correctly
 # when the arm segment is treated as the IMU's local +X axis.
@@ -288,6 +291,57 @@ def build_arm_positions():
     return shoulder, upper_imu, elbow, forearm_imu, hand
 
 
+def equation_geometry(theta_deg):
+    """Return w(theta), b, and dw/d(theta_deg) for the 2D model."""
+    theta_rad = np.radians(theta_deg)
+
+    a = ELBOW_TO_FOREARM_IMU
+    b_mag = UPPER_IMU_TO_ELBOW
+
+    # At theta = 0, w is negative in the vertical direction and b is positive.
+    w = np.array([
+        a * np.sin(theta_rad),
+        -a * np.cos(theta_rad),
+    ])
+
+    b = np.array([
+        0.0,
+        b_mag,
+    ])
+
+    # Derivative with respect to degrees, not radians.
+    w_prime = (np.pi / 180.0) * np.array([
+        a * np.cos(theta_rad),
+        a * np.sin(theta_rad),
+    ])
+
+    return w, b, w_prime
+
+
+def calculate_rest_terms():
+    """Calculate L0 and re0 at the physical rest angle THETA0_DEG."""
+    w0, b, w_prime0 = equation_geometry(THETA0_DEG)
+    difference0 = w0 - b
+    l0 = np.linalg.norm(difference0)
+
+    if l0 < 1e-12:
+        return 0.0, 0.0
+
+    # Use the supplied formula directly:
+    # re0 = ((w(theta0) - b)^T w'(theta0)) / ||w(theta0) - b||
+    re0 = np.dot(difference0, w_prime0) / l0
+    return float(l0), float(re0)
+
+
+L_0, RE_0 = calculate_rest_terms()
+
+
+def taylor_length_from_joint_angle(joint_angle_deg):
+    """First-order Taylor estimate using the zeroed IMU joint angle."""
+    # The sensor's zeroed angle is delta-theta from the 30-degree rest pose.
+    return L_0 + RE_0 * (joint_angle_deg - THETA0_DEG)
+
+
 def fmt_point(name, p):
     return f"{name}: ({p[0]: .3f}, {p[1]: .3f}, {p[2]: .3f})"
 
@@ -306,12 +360,15 @@ def main():
     reader = threading.Thread(target=serial_reader_thread, args=(ser_global,), daemon=True)
     reader.start()
 
-    fig = plt.figure(figsize=(14, 7))
-    ax = fig.add_subplot(1, 2, 1, projection="3d")
-    angle_ax = fig.add_subplot(1, 2, 2)
+    fig = plt.figure(figsize=(19, 7))
+    ax = fig.add_subplot(1, 3, 1, projection="3d")
+    angle_ax = fig.add_subplot(1, 3, 2)
+    distance_ax = fig.add_subplot(1, 3, 3)
 
     history_time = deque(maxlen=300)
     history_angle = deque(maxlen=300)
+    history_measured_distance = deque(maxlen=300)
+    history_taylor_distance = deque(maxlen=300)
     history_start_time = time.monotonic()
 
     total_len = SHOULDER_TO_UPPER_IMU + UPPER_IMU_TO_ELBOW + ELBOW_TO_FOREARM_IMU + FOREARM_IMU_TO_HAND
@@ -343,6 +400,18 @@ def main():
     angle_ax.grid(True, alpha=0.3)
     angle_ax.set_ylim(-180, 180)
     angle_ax.legend(loc="upper right")
+
+    measured_distance_line, = distance_ax.plot(
+        [], [], linewidth=2, label="Measured IMU distance"
+    )
+    taylor_distance_line, = distance_ax.plot(
+        [], [], linewidth=2, label="First-order Taylor estimate"
+    )
+    distance_ax.set_title("IMU Distance vs Taylor Estimate")
+    distance_ax.set_xlabel("Time (s)")
+    distance_ax.set_ylabel("Distance")
+    distance_ax.grid(True, alpha=0.3)
+    distance_ax.legend(loc="upper right")
 
     text = fig.text(0.02, 0.01, "", transform=fig.transFigure, verticalalignment="bottom", fontsize=9)
 
@@ -380,18 +449,30 @@ def main():
             }
             history_time.clear()
             history_angle.clear()
+            history_measured_distance.clear()
+            history_taylor_distance.clear()
             history_start_time = time.monotonic()
             angle_line.set_data([], [])
+            measured_distance_line.set_data([], [])
+            taylor_distance_line.set_data([], [])
             angle_ax.set_ylim(-180, 180)
+            distance_ax.set_xlim(0.0, 1.0)
+            distance_ax.set_ylim(max(0.0, L_0 - 1.0), L_0 + 1.0)
             print("Cleared Python-side telemetry.")
         elif event.key == "g":
             history_time.clear()
             history_angle.clear()
+            history_measured_distance.clear()
+            history_taylor_distance.clear()
             history_start_time = time.monotonic()
             angle_line.set_data([], [])
+            measured_distance_line.set_data([], [])
+            taylor_distance_line.set_data([], [])
             angle_ax.set_xlim(0.0, 1.0)
             angle_ax.set_ylim(-180, 180)
-            print("Reset joint angle graph.")
+            distance_ax.set_xlim(0.0, 1.0)
+            distance_ax.set_ylim(max(0.0, L_0 - 1.0), L_0 + 1.0)
+            print("Reset graphs.")
         elif event.key == "q":
             stop_event.set()
             plt.close(fig)
@@ -419,18 +500,56 @@ def main():
         if latest["quat_lines_parsed"] > 0 and abs(joint_display_deg) < 1e-9:
             joint_display_deg = quat_angle_deg(latest["q_joint"])
 
+        # Straight-line 3D distance between the two plotted IMU positions.
+        measured_imu_distance = np.linalg.norm(forearm_imu - upper_imu)
+
+        
+
+        # First-order Taylor approximation about the 30-degree rest pose.
+        taylor_distance = taylor_length_from_joint_angle(joint_display_deg)
+
         history_time.append(time.monotonic() - history_start_time)
         history_angle.append(joint_display_deg)
+        history_measured_distance.append(measured_imu_distance)
+        history_taylor_distance.append(taylor_distance)
+
         angle_line.set_data(list(history_time), list(history_angle))
+        measured_distance_line.set_data(
+            list(history_time), list(history_measured_distance)
+        )
+        taylor_distance_line.set_data(
+            list(history_time), list(history_taylor_distance)
+        )
+
         if history_angle:
             angle_ax.set_xlim(0.0, max(1.0, history_time[-1] + 1.0))
             min_angle = min(history_angle) - 5
             max_angle = max(history_angle) + 5
             angle_ax.set_ylim(min_angle, max_angle)
 
+        if history_measured_distance and history_taylor_distance:
+            distance_ax.set_xlim(0.0, max(1.0, history_time[-1] + 1.0))
+
+            all_distances = (
+                list(history_measured_distance) +
+                list(history_taylor_distance)
+            )
+            min_distance = min(all_distances)
+            max_distance = max(all_distances)
+            span = max_distance - min_distance
+            padding = max(0.1, 0.10 * span)
+
+            distance_ax.set_ylim(
+                max(0.0, min_distance - padding),
+                max_distance + padding,
+            )
+
         status = [
-            "Keys: 0-9 target | left/right manual | p pause | r recalibrate | m menu | c clear | g reset graph | q quit",
+            "0-9 target | left/right | p pause | r recalibrate | c clear | g reset graph | q quit",
             f"Target: {latest['target_deg']:.2f} deg | Joint: {joint_display_deg:.2f} deg | Error: {latest['error_deg']:.2f} deg",
+            f"theta0: {THETA0_DEG:.2f} deg",
+            f"Measured IMU distance: {measured_imu_distance:.4f} | Taylor estimate: {taylor_distance:.4f}",
+            f"L0: {L_0:.4f} | re0: {RE_0:.6f} distance/deg",
             fmt_point("Shoulder", shoulder),
             fmt_point("Upper IMU", upper_imu),
             fmt_point("Elbow", elbow),
@@ -439,7 +558,15 @@ def main():
         ]
         text.set_text("\n".join(status))
 
-        return (*dots, upper_line, forearm_line, angle_line, text)
+        return (
+            *dots,
+            upper_line,
+            forearm_line,
+            angle_line,
+            measured_distance_line,
+            taylor_distance_line,
+            text,
+        )
 
     # Keep a reference to the animation. Without this, Matplotlib can garbage-collect
     # the animation object and the update function may never run.
