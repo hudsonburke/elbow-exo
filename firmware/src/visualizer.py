@@ -2,7 +2,7 @@
 
 # Keyboard controls inside the plot window:
 #   0-9        send selected target angle
-#   o          start oscillation mode in C++ code
+#   x          start/stop sinusoidal trajectory in C++ code
 #   left       manual motor reverse
 #   right      manual motor forward
 #   p/space    pause both motors, same as sending 's' in C++ code
@@ -23,7 +23,6 @@ import numpy as np
 import serial
 
 
-
 # =====================================================
 # Configuration
 # =====================================================
@@ -31,10 +30,12 @@ import serial
 SERIAL_PORT = "COM8"
 BAUD_RATE = 115200
 
-WINDOW_SIZE = (14, 10)
+# Smaller overall window
+WINDOW_SIZE = (15, 11.5)
 
-ARM_PANEL_WIDTH = 1.1
-GRAPH_PANEL_WIDTH = 0.9
+# Slightly smaller 3D visualizer panel
+ARM_PANEL_WIDTH = 0.95
+GRAPH_PANEL_WIDTH = 1.0
 
 HISTORY_POINTS = 300
 ANIMATION_INTERVAL_MS = 35
@@ -68,9 +69,24 @@ def multiply_quaternions(q1, q2):
     ])
 
 
-DISPLAY_OFFSET_BASE = np.array([-0.7071067811865476, 0.0, 0.7071067811865476, 0.0])
-DISPLAY_OFFSET_EXTRA = np.array([-0.7071067811865476, 0.0, 0.0, 0.7071067811865476])
-DISPLAY_ROTATION = multiply_quaternions(DISPLAY_OFFSET_EXTRA, DISPLAY_OFFSET_BASE)
+DISPLAY_OFFSET_BASE = np.array([
+    -0.7071067811865476,
+    0.0,
+    0.7071067811865476,
+    0.0,
+])
+
+DISPLAY_OFFSET_EXTRA = np.array([
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476,
+])
+
+DISPLAY_ROTATION = multiply_quaternions(
+    DISPLAY_OFFSET_EXTRA,
+    DISPLAY_OFFSET_BASE
+)
 
 
 def normalize_quaternion(q):
@@ -130,7 +146,8 @@ FLOAT_PATTERN = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
 
 QUATERNION_LINE_PATTERN = re.compile(
     rf"^\s*(qUpperZeroed|qForearmZeroed|qJointZeroed)\s*:\s*"
-    rf"({FLOAT_PATTERN}),\s*({FLOAT_PATTERN}),\s*({FLOAT_PATTERN}),\s*({FLOAT_PATTERN})"
+    rf"({FLOAT_PATTERN}),\s*({FLOAT_PATTERN}),\s*"
+    rf"({FLOAT_PATTERN}),\s*({FLOAT_PATTERN})"
 )
 
 CURRENT_ANGLE_PATTERN = re.compile(rf"CurrentDeg\s*:\s*({FLOAT_PATTERN})")
@@ -139,9 +156,12 @@ ERROR_ANGLE_PATTERN = re.compile(rf"ErrorDeg\s*:\s*({FLOAT_PATTERN})")
 
 PWM_NORM_PATTERN = re.compile(rf"PWMNorm\s*:\s*({FLOAT_PATTERN})")
 PWM_PATTERN = re.compile(r"PWM\s*:\s*(-?\d+)")
+U_CMD_PATTERN = re.compile(rf"UCmd\s*:\s*({FLOAT_PATTERN})")
 
 MODE_PATTERN = re.compile(r"Mode\s*:\s*([A-Za-z]+)")
-COUNTS_PATTERN = re.compile(r"M1Counts\s*:\s*(-?\d+)\s*\|\s*M2Counts\s*:\s*(-?\d+)")
+COUNTS_PATTERN = re.compile(
+    r"M1Counts\s*:\s*(-?\d+)\s*\|\s*M2Counts\s*:\s*(-?\d+)"
+)
 
 
 # =====================================================
@@ -163,6 +183,7 @@ telemetry = {
 
     "pwm_norm": 0.0,
     "pwm": 0,
+    "u_cmd": 0.0,
 
     "mode": "unknown",
     "motor_1_counts": 0,
@@ -288,6 +309,11 @@ def parse_serial_line(line):
     if pwm_match:
         telemetry["pwm"] = int(pwm_match.group(1))
 
+    u_cmd_match = U_CMD_PATTERN.search(line)
+
+    if u_cmd_match:
+        telemetry["u_cmd"] = float(u_cmd_match.group(1))
+
     mode_match = MODE_PATTERN.search(line)
 
     if mode_match:
@@ -314,11 +340,17 @@ def calculate_arm_positions():
     base_axis = normalize_vector(IMU_SEGMENT_AXIS_LOCAL)
 
     upper_display_quaternion = normalize_quaternion(
-        multiply_quaternions(DISPLAY_ROTATION, telemetry["upper_quaternion"])
+        multiply_quaternions(
+            DISPLAY_ROTATION,
+            telemetry["upper_quaternion"]
+        )
     )
 
     forearm_display_quaternion = normalize_quaternion(
-        multiply_quaternions(DISPLAY_ROTATION, telemetry["forearm_quaternion"])
+        multiply_quaternions(
+            DISPLAY_ROTATION,
+            telemetry["forearm_quaternion"]
+        )
     )
 
     upper_direction = rotate_vector_by_quaternion(
@@ -367,6 +399,7 @@ def reset_telemetry():
 
         "pwm_norm": 0.0,
         "pwm": 0,
+        "u_cmd": 0.0,
 
         "mode": "cleared",
         "motor_1_counts": 0,
@@ -400,32 +433,33 @@ def main():
     figure = plt.figure(figsize=WINDOW_SIZE)
 
     grid = figure.add_gridspec(
-        3,
+        4,
         2,
         width_ratios=[ARM_PANEL_WIDTH, GRAPH_PANEL_WIDTH],
-        height_ratios=[1.0, 1.0, 1.0],
+        height_ratios=[1.0, 1.0, 1.0, 1.0],
         wspace=0.35,
-        hspace=0.50
+        hspace=0.75
     )
 
     arm_axis = figure.add_subplot(grid[:, 0], projection="3d")
     angle_axis = figure.add_subplot(grid[0, 1])
     pwm_axis = figure.add_subplot(grid[1, 1])
-    pwm_error_axis = figure.add_subplot(grid[2, 1])
+    u_time_axis = figure.add_subplot(grid[2, 1])
+    angle_u_axis = figure.add_subplot(grid[3, 1])
 
     figure.subplots_adjust(
         left=0.04,
         right=0.97,
         top=0.96,
-        bottom=0.24
+        bottom=0.09
     )
 
     time_history = deque(maxlen=HISTORY_POINTS)
     angle_history = deque(maxlen=HISTORY_POINTS)
     pwm_norm_history = deque(maxlen=HISTORY_POINTS)
 
-    error_history = deque(maxlen=HISTORY_POINTS)
-    pwm_history = deque(maxlen=HISTORY_POINTS)
+    u_history = deque(maxlen=HISTORY_POINTS)
+    angle_for_u_history = deque(maxlen=HISTORY_POINTS)
 
     start_time = time.monotonic()
 
@@ -442,11 +476,11 @@ def main():
     arm_axis.set_ylim(-axis_limit, axis_limit)
     arm_axis.set_zlim(-axis_limit, axis_limit)
 
-    arm_axis.set_xlabel("X", fontsize=9)
-    arm_axis.set_ylabel("Y", fontsize=9)
-    arm_axis.set_zlabel("Z", fontsize=9)
-    arm_axis.set_title("Arm Visualizer", fontsize=12, pad=8)
-    arm_axis.tick_params(axis="both", which="major", labelsize=8)
+    arm_axis.set_xlabel("X", fontsize=8)
+    arm_axis.set_ylabel("Y", fontsize=8)
+    arm_axis.set_zlabel("Z", fontsize=8)
+    arm_axis.set_title("3D Arm Orientation From IMUs", fontsize=11, pad=8)
+    arm_axis.tick_params(axis="both", which="major", labelsize=7)
 
     try:
         arm_axis.set_box_aspect([1, 1, 1])
@@ -494,46 +528,90 @@ def main():
         linewidth=3
     )
 
-    angle_line, = angle_axis.plot([], [], linewidth=2, label="Joint angle")
-    angle_axis.set_title("Joint Angle vs Time", fontsize=11)
-    angle_axis.set_xlabel("Time (s)", fontsize=9)
-    angle_axis.set_ylabel("Angle (deg)", fontsize=9)
+    # ---------------------
+    # Graph 1: theta(t) vs time
+    # ---------------------
+
+    angle_line, = angle_axis.plot(
+        [],
+        [],
+        linewidth=2,
+        label="θ(t)"
+    )
+
+    angle_axis.set_title("Output θ(t): Joint Angle vs Time", fontsize=10)
+    angle_axis.set_xlabel("Time t (s)", fontsize=8)
+    angle_axis.set_ylabel("Joint angle θ(t)", fontsize=8)
     angle_axis.grid(True, alpha=0.3)
     angle_axis.set_ylim(-180, 180)
-    angle_axis.legend(loc="upper right", fontsize=8)
+    angle_axis.legend(loc="upper right", fontsize=7)
 
-    pwm_norm_line, = pwm_axis.plot([], [], linewidth=2, label="PWMNorm")
-    pwm_axis.set_title("Normalized PWM Signal", fontsize=11)
-    pwm_axis.set_xlabel("Time (s)", fontsize=9)
-    pwm_axis.set_ylabel("Normalized PWM", fontsize=9)
+    # ---------------------
+    # Graph 2: normalized PWM vs time
+    # ---------------------
+
+    pwm_norm_line, = pwm_axis.plot(
+        [],
+        [],
+        linewidth=2,
+        label="PWMNorm"
+    )
+
+    pwm_axis.set_title("Normalized Control Effort |u(t)|", fontsize=10)
+    pwm_axis.set_xlabel("Time t (s)", fontsize=8)
+    pwm_axis.set_ylabel("PWMNorm", fontsize=8)
     pwm_axis.grid(True, alpha=0.3)
     pwm_axis.set_ylim(-0.05, 1.05)
-    pwm_axis.legend(loc="upper right", fontsize=8)
+    pwm_axis.legend(loc="upper right", fontsize=7)
 
-    pwm_error_line, = pwm_error_axis.plot(
+    # ---------------------
+    # Graph 3: signed u(t) vs time
+    # ---------------------
+
+    u_time_line, = u_time_axis.plot(
+        [],
+        [],
+        linewidth=2,
+        label="u(t)"
+    )
+
+    u_time_axis.set_title("u(t): Signed PWM Command vs Time", fontsize=10)
+    u_time_axis.set_xlabel("Time t (s)", fontsize=8)
+    u_time_axis.set_ylabel("u(t)", fontsize=8)
+    u_time_axis.grid(True, alpha=0.3)
+    u_time_axis.set_xlim(0.0, 1.0)
+    u_time_axis.set_ylim(-260, 260)
+    u_time_axis.legend(loc="upper right", fontsize=7)
+
+    # ---------------------
+    # Graph 4: theta(t) vs u(t)
+    # ---------------------
+
+    angle_u_line, = angle_u_axis.plot(
         [],
         [],
         linewidth=2,
         marker=".",
         markersize=3,
-        label="PWM vs Error"
+        label="θ(t) vs u(t)"
     )
 
-    pwm_error_axis.set_title("Actual PWM vs Error e(t)", fontsize=11)
-    pwm_error_axis.set_xlabel("Error e(t) (deg)", fontsize=9)
-    pwm_error_axis.set_ylabel("PWM value", fontsize=9)
-    pwm_error_axis.grid(True, alpha=0.3)
-    pwm_error_axis.set_xlim(-1.0, 1.0)
-    pwm_error_axis.set_ylim(-5, 260)
-    pwm_error_axis.legend(loc="upper right", fontsize=8)
+    angle_u_axis.set_title("G(t): θ(t)/u(t)", fontsize=10)
+    angle_u_axis.set_xlabel("u(t)", fontsize=8)
+    angle_u_axis.set_ylabel("θ(t)", fontsize=8)
+    angle_u_axis.grid(True, alpha=0.3)
+    angle_u_axis.set_xlim(-300, 300)
+    angle_u_axis.set_ylim(-10, 120)
+    angle_u_axis.legend(loc="upper right", fontsize=7)
 
+    # Smaller bottom status text
     status_text = figure.text(
         0.02,
-        0.01,
+        0.005,
         "",
         transform=figure.transFigure,
         verticalalignment="bottom",
-        fontsize=9
+        fontsize=7
     )
 
     def reset_plot_history():
@@ -542,8 +620,8 @@ def main():
         time_history.clear()
         angle_history.clear()
         pwm_norm_history.clear()
-        error_history.clear()
-        pwm_history.clear()
+        u_history.clear()
+        angle_for_u_history.clear()
 
         start_time = time.monotonic()
 
@@ -555,9 +633,13 @@ def main():
         pwm_axis.set_xlim(0.0, 1.0)
         pwm_axis.set_ylim(-0.05, 1.05)
 
-        pwm_error_line.set_data([], [])
-        pwm_error_axis.set_xlim(-1.0, 1.0)
-        pwm_error_axis.set_ylim(-5, 260)
+        u_time_line.set_data([], [])
+        u_time_axis.set_xlim(0.0, 1.0)
+        u_time_axis.set_ylim(-260, 260)
+
+        angle_u_line.set_data([], [])
+        angle_u_axis.set_xlim(-260, 260)
+        angle_u_axis.set_ylim(-5, 95)
 
     def handle_key_press(event):
         if event.key is None:
@@ -578,7 +660,7 @@ def main():
 
         elif key == "x":
             send_serial_command("x")
-            print("Oscillation command sent.")
+            print("Trajectory command sent.")
 
         elif key == "r":
             send_serial_command("r")
@@ -643,7 +725,9 @@ def main():
         joint_angle = telemetry["current_angle"]
 
         if telemetry["quaternion_lines_read"] > 0 and abs(joint_angle) < 1e-9:
-            joint_angle = quaternion_angle_degrees(telemetry["joint_quaternion"])
+            joint_angle = quaternion_angle_degrees(
+                telemetry["joint_quaternion"]
+            )
 
         current_time = time.monotonic() - start_time
 
@@ -651,9 +735,10 @@ def main():
         angle_history.append(joint_angle)
         pwm_norm_history.append(telemetry["pwm_norm"])
 
-        error_history.append(telemetry["error_angle"])
-        pwm_history.append(telemetry["pwm"])
+        u_history.append(telemetry["u_cmd"])
+        angle_for_u_history.append(joint_angle)
 
+        # Graph 1: θ(t)
         angle_line.set_data(list(time_history), list(angle_history))
 
         if angle_history:
@@ -671,7 +756,11 @@ def main():
 
             angle_axis.set_ylim(min_angle, max_angle)
 
-        pwm_norm_line.set_data(list(time_history), list(pwm_norm_history))
+        # Graph 2: PWMNorm
+        pwm_norm_line.set_data(
+            list(time_history),
+            list(pwm_norm_history)
+        )
 
         if pwm_norm_history:
             left_time = time_history[0]
@@ -680,27 +769,50 @@ def main():
             pwm_axis.set_xlim(left_time, right_time)
             pwm_axis.set_ylim(-0.05, 1.05)
 
-        pwm_error_line.set_data(list(error_history), list(pwm_history))
+        # Graph 3: u(t)
+        u_time_line.set_data(
+            list(time_history),
+            list(u_history)
+        )
 
-        if error_history:
-            min_error = min(error_history) - 2.0
-            max_error = max(error_history) + 2.0
+        if u_history:
+            left_time = time_history[0]
+            right_time = max(left_time + 1.0, time_history[-1] + 1.0)
 
-            if abs(max_error - min_error) < 1.0:
-                min_error -= 1.0
-                max_error += 1.0
+            u_time_axis.set_xlim(left_time, right_time)
+            u_time_axis.set_ylim(-260, 260)
 
-            pwm_error_axis.set_xlim(min_error, max_error)
-            pwm_error_axis.set_ylim(-5, 260)
+        # Graph 4: θ(t) vs u(t)
+        angle_u_line.set_data(
+            list(u_history),
+            list(angle_for_u_history)
+        )
+
+        angle_u_axis.set_xlim(-260, 260)
+
+        if angle_for_u_history:
+            min_angle_u = min(angle_for_u_history) - 5.0
+            max_angle_u = max(angle_for_u_history) + 5.0
+
+            if abs(max_angle_u - min_angle_u) < 1.0:
+                min_angle_u -= 1.0
+                max_angle_u += 1.0
+
+            angle_u_axis.set_ylim(min_angle_u, max_angle_u)
 
         status_lines = [
-            "Keys: 0-9 target | x oscillate | left/right manual | p/space pause | r recalibrate | m menu | c clear | g reset graphs | q quit",
+            (
+                "Keys: 0-9 target | x trajectory | left/right manual | "
+                "p/space pause | r recalibrate | m menu | "
+                "c clear | g reset graphs | q quit"
+            ),
             (
                 f"Target: {telemetry['target_angle']:.2f} deg | "
-                f"Joint: {joint_angle:.2f} deg | "
+                f"θ(t): {joint_angle:.2f} deg | "
                 f"Error: {telemetry['error_angle']:.2f} deg | "
                 f"PWMNorm: {telemetry['pwm_norm']:.3f} | "
                 f"PWM: {telemetry['pwm']} | "
+                f"u(t)=UCmd: {telemetry['u_cmd']:.2f} | "
                 f"Mode: {telemetry['mode']}"
             ),
             format_point("Shoulder", shoulder),
@@ -718,7 +830,8 @@ def main():
             forearm_line,
             angle_line,
             pwm_norm_line,
-            pwm_error_line,
+            u_time_line,
+            angle_u_line,
             status_text,
         )
 

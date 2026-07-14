@@ -7,9 +7,12 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
+// ======================================================
 // Dual BNO055 IMU + Motor 2 PID Control
 // IMU spike rejection + low-pass filtering
-
+// Sinusoidal trajectory mode
+// Correct UCmd = signed PWM command for graphing/system ID
+// ======================================================
 
 // ---------------------
 // IMU setup
@@ -100,19 +103,20 @@ const float KEY_TGTS[10] = {
 };
 
 // ---------------------
-// Oscillation settings
+// Trajectory settings
 // ---------------------
 
-bool oscOn = false;
-bool oscWait = false;
+bool trajOn = false;
 
-int oscPhase = 0;
-int oscDone = 0;
+// Change this between 0.05 and 0.10 for your real testing.
+// 0.05 Hz = 20 second period.
+// 0.10 Hz = 10 second period.
+const float TRAJ_FREQ = 0.05;
 
-const int OSC_CYCLES = 5;
-const unsigned long OSC_WAIT_MS = 2000;
+const float TRAJ_CENTER_DEG = 45.0;
+const float TRAJ_AMP_DEG = 45.0;
 
-unsigned long oscStartMs = 0;
+unsigned long trajStartMs = 0;
 
 // ---------------------
 // Motor struct
@@ -149,6 +153,7 @@ struct Motor {
 
   float lastUNorm;
   int lastPwm;
+  float lastU;
 
   bool active;
   bool holding;
@@ -169,7 +174,7 @@ Motor m1 = {
   1.0, 10.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
-  0.0, 0,
+  0.0, 0, 0.0,
 
   false, false, false,
   0
@@ -187,7 +192,7 @@ Motor m2 = {
   1.0, 5.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
-  0.0, 0,
+  0.0, 0, 0.0,
 
   false, false, false,
   0
@@ -204,9 +209,9 @@ int escState = 0;
 unsigned long lastCtrlUs = 0;
 unsigned long lastPrintMs = 0;
 
-
+// ======================================================
 // Function declarations
-
+// ======================================================
 
 Quat normQ(Quat q);
 Quat conjQ(Quat q);
@@ -239,9 +244,10 @@ void resetMotor(Motor& m);
 void resetTargets();
 void setTarget(float deg);
 
-void startOsc();
-void stopOsc();
-void updateOsc();
+float calcTraj(float t);
+void startTraj();
+void stopTraj();
+void updateTraj();
 
 void serialCheck();
 void handleChar(char c);
@@ -252,9 +258,9 @@ void printQuat(const char* label, Quat q);
 void printData();
 void menu();
 
-
+// ======================================================
 // Quaternion math
-
+// ======================================================
 
 Quat normQ(Quat q) {
   float n = sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
@@ -307,9 +313,9 @@ float angleQ(Quat q) {
   return 2.0 * acos(w) * 180.0 / PI;
 }
 
-
+// ======================================================
 // IMU filter
-
+// ======================================================
 
 float filtJoint(float raw) {
   if (!filtOn) {
@@ -358,9 +364,9 @@ void resetFilt(float start) {
   rejSpks = 0;
 }
 
-
+// ======================================================
 // IMU functions
-
+// ======================================================
 
 bool imuStart() {
   Wire.begin();
@@ -445,9 +451,9 @@ void imuZero() {
   Serial.println("IMU recalibrated. Current joint angle is now 0.");
 }
 
-
+// ======================================================
 // Angle helpers
-
+// ======================================================
 
 float axisVal() {
   return ang;
@@ -457,9 +463,9 @@ float errDeg(float target, float current) {
   return target - current;
 }
 
-
+// ======================================================
 // Motor helpers
-
+// ======================================================
 
 long counts(Motor& m) {
   return m.encSign * m.enc->read();
@@ -504,9 +510,9 @@ float sat1(float x) {
   return x;
 }
 
-
+// ======================================================
 // PID controller
-
+// ======================================================
 
 void pid(Motor& m, float dt, bool enabled) {
   if (!imuReady() || !enabled) {
@@ -519,12 +525,15 @@ void pid(Motor& m, float dt, bool enabled) {
     off(m);
     m.lastUNorm = 0.0;
     m.lastPwm = 0;
+    m.lastU = 0.0;
     return;
   }
 
   float current = axisVal();
   float error = errDeg(m.target, current);
   float absErr = fabs(error);
+
+  bool trajMode = trajOn && (&m == &m2);
 
   bool errFlip =
       (error > 0.0 && m.lastErr < 0.0) ||
@@ -534,14 +543,19 @@ void pid(Motor& m, float dt, bool enabled) {
     m.sumErr = 0.0;
   }
 
-  float exitTol = m.tol * 1.5;
-  bool atTarget = m.holding ? (absErr <= exitTol) : (absErr <= m.tol);
+  bool atTarget = false;
+
+  if (!trajMode) {
+    float exitTol = m.tol * 1.5;
+    atTarget = m.holding ? (absErr <= exitTol) : (absErr <= m.tol);
+  }
 
   if (atTarget) {
     hold(m);
 
     m.lastUNorm = 0.0;
     m.lastPwm = 0;
+    m.lastU = 0.0;
 
     m.sumErr = 0.0;
     m.lastErr = error;
@@ -568,13 +582,14 @@ void pid(Motor& m, float dt, bool enabled) {
     m.lastErr = error;
     m.lastMeas = current;
     m.lastOut = 0.0;
+    m.lastU = 0.0;
     m.startMs = millis();
 
     Serial.print(m.name);
     Serial.println(" moved away from target. PID re-engaging.");
   }
 
-  if (millis() - m.startMs > m.timeout) {
+  if (!trajMode && millis() - m.startMs > m.timeout) {
     Serial.print(m.name);
     Serial.println(" timeout. Motor stopped.");
 
@@ -623,7 +638,6 @@ void pid(Motor& m, float dt, bool enabled) {
   }
 
   float uNorm = sat1(fabs(out) / uFull);
-
   int pwmMin = min(m.minPwm, pwmLimit);
   int pwm = pwmMin + (int)((pwmLimit - pwmMin) * uNorm);
 
@@ -632,17 +646,22 @@ void pid(Motor& m, float dt, bool enabled) {
     uNorm = 0.0;
   }
 
+  int dir = (out >= 0.0) ? FWD : REV;
+
+  // Correct plant input signal:
+  // This is the signed PWM command actually sent to the motor driver.
+  float uCmd = dir * m.motSign * pwm;
+
   m.lastUNorm = uNorm;
   m.lastPwm = pwm;
-
-  int dir = (out >= 0.0) ? FWD : REV;
+  m.lastU = uCmd;
 
   drive(m, dir * m.motSign, pwm);
 }
 
-
-// Target, reset, and oscillation
-
+// ======================================================
+// Target, reset, and trajectory
+// ======================================================
 
 bool motorEnabled(Motor& m) {
   if (&m == &m1) {
@@ -668,10 +687,11 @@ void resetMotor(Motor& m) {
 
   m.lastUNorm = 0.0;
   m.lastPwm = 0;
+  m.lastU = 0.0;
 }
 
 void resetTargets() {
-  stopOsc();
+  stopTraj();
 
   resetMotor(m1);
   resetMotor(m2);
@@ -687,6 +707,8 @@ void resetTargets() {
 }
 
 void setTarget(float deg) {
+  stopTraj();
+
   manMode = false;
   manDir = 0;
 
@@ -703,6 +725,7 @@ void setTarget(float deg) {
   m2.lastOut = 0.0;
   m2.lastUNorm = 0.0;
   m2.lastPwm = 0;
+  m2.lastU = 0.0;
   m2.startMs = millis();
 
   Serial.print("New Motor 2 target: ");
@@ -710,74 +733,61 @@ void setTarget(float deg) {
   Serial.println(" deg");
 }
 
-void startOsc() {
+float calcTraj(float t) {
+  return TRAJ_CENTER_DEG
+         - TRAJ_AMP_DEG * cos(2.0 * PI * TRAJ_FREQ * t - 2.0 * PI);
+}
+
+void startTraj() {
   manMode = false;
   manDir = 0;
 
-  oscOn = true;
-  oscWait = false;
-  oscPhase = 0;
-  oscDone = 0;
-  oscStartMs = 0;
+  trajOn = true;
+  trajStartMs = millis();
 
-  Serial.println("Oscillation started.");
+  float current = axisVal();
 
-  setTarget(KEY_TGTS[0]);
+  m2.target = calcTraj(0.0);
+  m2.active = true;
+  m2.holding = false;
+  m2.printed = false;
+
+  m2.lastErr = errDeg(m2.target, current);
+  m2.sumErr = 0.0;
+  m2.lastMeas = current;
+  m2.lastOut = 0.0;
+  m2.lastUNorm = 0.0;
+  m2.lastPwm = 0;
+  m2.lastU = 0.0;
+  m2.startMs = millis();
+
+  Serial.print("Sinusoidal trajectory started. Frequency: ");
+  Serial.print(TRAJ_FREQ, 3);
+  Serial.println(" Hz");
 }
 
-void stopOsc() {
-  oscOn = false;
-  oscWait = false;
-  oscPhase = 0;
-  oscDone = 0;
-  oscStartMs = 0;
+void stopTraj() {
+  trajOn = false;
+  trajStartMs = 0;
 }
 
-void updateOsc() {
-  if (!oscOn || manMode) {
+void updateTraj() {
+  if (!trajOn || manMode) {
     return;
   }
 
-  if (!m2.holding) {
-    oscWait = false;
-    return;
-  }
+  float t = (millis() - trajStartMs) / 1000.0;
 
-  if (!oscWait) {
-    oscWait = true;
-    oscStartMs = millis();
-    return;
-  }
+  m2.target = calcTraj(t);
+  m2.active = true;
 
-  if (millis() - oscStartMs < OSC_WAIT_MS) {
-    return;
-  }
-
-  oscWait = false;
-
-  if (oscPhase == 0) {
-    oscPhase = 1;
-    setTarget(KEY_TGTS[9]);
-  } else if (oscPhase == 1) {
-    oscPhase = 2;
-    setTarget(KEY_TGTS[0]);
-  } else if (oscPhase == 2) {
-    oscDone++;
-
-    if (oscDone >= OSC_CYCLES) {
-      stopOsc();
-      Serial.println("Oscillation finished.");
-      return;
-    }
-
-    oscPhase = 1;
-    setTarget(KEY_TGTS[9]);
-  }
+  m2.holding = false;
+  m2.printed = false;
 }
 
-
+// ======================================================
 // Serial commands
-
+// ======================================================
 
 void serialCheck() {
   while (Serial.available() > 0) {
@@ -804,15 +814,19 @@ void handleChar(char c) {
   }
 
   if (isdigit(c)) {
-    stopOsc();
-
     int digit = c - '0';
     setTarget(KEY_TGTS[digit]);
     return;
   }
 
   if (c == 'x' || c == 'X') {
-    startOsc();
+    if (trajOn) {
+      Serial.println("Sinusoidal trajectory stopped.");
+      resetTargets();
+    } else {
+      startTraj();
+    }
+
     return;
   }
 
@@ -839,7 +853,7 @@ void handleChar(char c) {
 }
 
 void handleArrow(char c) {
-  stopOsc();
+  stopTraj();
 
   if (c == 'D') {
     manMode = true;
@@ -862,9 +876,9 @@ void handleArrow(char c) {
   }
 }
 
-
+// ======================================================
 // Main update
-
+// ======================================================
 
 void updateAll() {
   serialCheck();
@@ -898,6 +912,9 @@ void updateAll() {
     m2.lastPwm = MAN_PWM;
     m2.lastUNorm = (float)MAN_PWM / (float)m2.maxPwm;
 
+    // Correct signed manual command.
+    m2.lastU = manDir * m2.motSign * MAN_PWM;
+
     if (m2.lastUNorm > 1.0) {
       m2.lastUNorm = 1.0;
     }
@@ -917,6 +934,7 @@ void updateAll() {
     m2.lastOut = 0.0;
     m2.lastUNorm = 0.0;
     m2.lastPwm = 0;
+    m2.lastU = 0.0;
     m2.holding = false;
     m2.printed = false;
     m2.startMs = millis();
@@ -924,17 +942,17 @@ void updateAll() {
     wasMan = false;
   }
 
+  updateTraj();
+
   pid(m1, dt, motorEnabled(m1));
   pid(m2, dt, motorEnabled(m2));
-
-  updateOsc();
 
   printData();
 }
 
-
+// ======================================================
 // Printing
-
+// ======================================================
 
 void printQuat(const char* label, Quat q) {
   Serial.print(label);
@@ -980,17 +998,23 @@ void printData() {
   Serial.print(" | PWM: ");
   Serial.print(m2.lastPwm);
 
+  Serial.print(" | UCmd: ");
+  Serial.print(m2.lastU, 3);
+
   Serial.print(" | Mode: ");
 
   if (manMode) {
     Serial.print("Manual");
-  } else if (oscOn) {
-    Serial.print("Osc");
+  } else if (trajOn) {
+    Serial.print("Traj");
   } else if (m2.active) {
     Serial.print("PID");
   } else {
     Serial.print("Idle");
   }
+
+  Serial.print(" | FreqHz: ");
+  Serial.print(TRAJ_FREQ, 3);
 
   Serial.print(" | M1Counts: ");
   Serial.print(counts(m1));
@@ -1003,9 +1027,9 @@ void printData() {
   printQuat("qJointZeroed", qJointZeroed);
 }
 
-
+// ======================================================
 // Menu
-
+// ======================================================
 
 void menu() {
   Serial.println();
@@ -1021,7 +1045,7 @@ void menu() {
   Serial.println("7 = 70 deg");
   Serial.println("8 = 80 deg");
   Serial.println("9 = 90 deg");
-  Serial.println("x    : Oscillate between key 0 and key 9 targets");
+  Serial.println("x    : Start/stop sinusoidal trajectory");
   Serial.println("Left : Manual Motor 2 reverse");
   Serial.println("Right: Manual Motor 2 forward");
   Serial.println("s/p  : Stop motor");
@@ -1031,9 +1055,9 @@ void menu() {
   Serial.println();
 }
 
-
+// ======================================================
 // Setup and loop
-
+// ======================================================
 
 void setup() {
   Serial.begin(115200);
