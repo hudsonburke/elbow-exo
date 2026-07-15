@@ -7,397 +7,386 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
-// =====================================================
-// Fast elbow exoskeleton data output
-// Prints:
-// DATA,time_ms,theta_deg,m1_counts,m2_counts
-// =====================================================
+// ======================================================
+// Dual BNO055 IMU + Motor 2 PID Control
+// IMU spike rejection + low-pass filtering
+// Sinusoidal trajectory mode
+// Correct UCmd = signed PWM command for graphing/system ID
+// ======================================================
 
+// ---------------------
+// IMU setup
+// ---------------------
 
-// =====================================================
-// Pin setup
-// =====================================================
+Adafruit_BNO055 bnoUpper(0, 0x28, &Wire);
+Adafruit_BNO055 bnoForearm(1, 0x28, &Wire1);
 
-// Motor 1 pins
-const int M1_IN1 = 4;
-const int M1_IN2 = 5;
-const int M1_ENC_A = 30;
-const int M1_ENC_B = 31;
-
-// Motor 2 pins
-const int M2_IN1 = 2;
-const int M2_IN2 = 3;
-const int M2_ENC_A = 28;
-const int M2_ENC_B = 29;
-
-
-// =====================================================
-// Serial print timing
-// =====================================================
-
-const unsigned long DATA_INTERVAL_MS = 10;     // 10 ms = about 100 Hz
-const unsigned long QUAT_INTERVAL_MS = 100;    // 100 ms = about 10 Hz
-
-const bool PRINT_FAST_DATA = true;
-const bool PRINT_QUATERNIONS_SLOW = true;
-
-
-// =====================================================
-// Motor direction constants
-// =====================================================
-
-const int FWD = 1;
-const int REV = -1;
-const int STOPPED = 0;
-
-
-// =====================================================
-// Encoder objects
-// =====================================================
-
-Encoder enc1(M1_ENC_A, M1_ENC_B);
-Encoder enc2(M2_ENC_A, M2_ENC_B);
-
-
-// =====================================================
-// IMU objects
-// =====================================================
-
-// Upper IMU is on Wire.
-// Forearm IMU is on Wire1.
-// If your I2C scanner shows the forearm IMU is 0x29, change 0x28 to 0x29 below.
-Adafruit_BNO055 bnoUpper = Adafruit_BNO055(0, 0x28, &Wire);
-Adafruit_BNO055 bnoForearm = Adafruit_BNO055(1, 0x28, &Wire1);
-
-
-// =====================================================
-// Quaternion struct
-// =====================================================
-
-struct Q {
+struct Quat {
   float w;
   float x;
   float y;
   float z;
 };
 
-Q qUpperZero = {1.0, 0.0, 0.0, 0.0};
-Q qForearmZero = {1.0, 0.0, 0.0, 0.0};
+Quat qUpRaw = {1.0, 0.0, 0.0, 0.0};
+Quat qForeRaw = {1.0, 0.0, 0.0, 0.0};
 
-Q qUpperZeroed = {1.0, 0.0, 0.0, 0.0};
-Q qForearmZeroed = {1.0, 0.0, 0.0, 0.0};
-Q qJointZeroed = {1.0, 0.0, 0.0, 0.0};
+Quat qUpZero = {1.0, 0.0, 0.0, 0.0};
+Quat qForeZero = {1.0, 0.0, 0.0, 0.0};
 
-
-// =====================================================
-// Angle filtering and IMU status
-// =====================================================
+Quat qUpZeroed = {1.0, 0.0, 0.0, 0.0};
+Quat qForeZeroed = {1.0, 0.0, 0.0, 0.0};
+Quat qJointZeroed = {1.0, 0.0, 0.0, 0.0};
 
 float ang = 0.0;
 float rawAng = 0.0;
-float filtAng = 0.0;
 
-bool filtInit = false;
 bool imuOk = false;
-bool lastImuReadOk = false;
 
-const float FILTER_ALPHA = 0.30;
-const float SPIKE_LIMIT_DEG = 35.0;
+// ---------------------
+// IMU filter
+// ---------------------
 
+float filtAng = 0.0;
+float avgAng = 0.0;
+float varAng = 0.0;
+float goodAng = 0.0;
 
-// =====================================================
+bool filtOn = false;
+unsigned long rejSpks = 0;
+
+const float FILT_A = 0.25;
+const float AVG_A = 0.10;
+const float VAR_A = 0.10;
+
+const float JMP_MAX = 25.0;
+const float VAR_MAX = 100.0;
+
+// ---------------------
+// Motor pins
+// ---------------------
+
+const int M1_IN1 = 4;
+const int M1_IN2 = 5;
+const int M1_ENC_A = 30;
+const int M1_ENC_B = 31;
+
+const int M2_IN1 = 2;
+const int M2_IN2 = 3;
+const int M2_ENC_A = 28;
+const int M2_ENC_B = 29;
+
+Encoder enc1(M1_ENC_A, M1_ENC_B);
+Encoder enc2(M2_ENC_A, M2_ENC_B);
+
+// ---------------------
+// Constants
+// ---------------------
+
+const int FWD = 1;
+const int REV = -1;
+
+const int M1_ENC_SIGN = 1;
+const int M2_ENC_SIGN = 1;
+
+const int M1_MOT_SIGN = 1;
+const int M2_MOT_SIGN = 1;
+
+const int MAN_PWM = 125;
+
+const unsigned long CTRL_US = 10000;
+const unsigned long PRINT_MS = 200;
+
+const float KEY_TGTS[10] = {
+  5.0, 10.0, 20.0, 30.0, 40.0,
+  50.0, 60.0, 70.0, 80.0, 90.0
+};
+
+// ---------------------
+// Trajectory settings
+// ---------------------
+
+bool trajOn = false;
+
+// Change this between 0.05 and 0.10 for your real testing.
+// 0.05 Hz = 20 second period.
+// 0.10 Hz = 10 second period.
+const float TRAJ_FREQ = 0.05;
+
+const float TRAJ_CENTER_DEG = 45.0;
+const float TRAJ_AMP_DEG = 45.0;
+
+unsigned long trajStartMs = 0;
+
+// ---------------------
 // Motor struct
-// =====================================================
+// ---------------------
 
 struct Motor {
+  const char* name;
+
   int in1;
   int in2;
-
   Encoder* enc;
 
   int encSign;
   int motSign;
 
-  float target;
-  float tol;
-  float slowZone;
-
-  bool active;
-
-  float integ;
-  float lastErr;
-
-  float lastUNorm;
-  float lastU;
-  int lastPwm;
+  float kp;
+  float kd;
+  float ki;
+  float uFull;
 
   int minPwm;
   int maxPwm;
   int slowPwm;
 
-  unsigned long startMs;
+  float tol;
+  float slowZone;
+  unsigned long timeout;
 
+  float target;
+  float lastErr;
+  float sumErr;
+  float lastMeas;
+  float lastOut;
+
+  float lastUNorm;
+  int lastPwm;
+  float lastU;
+
+  bool active;
   bool holding;
-};
+  bool printed;
 
+  unsigned long startMs;
+};
 
 Motor m1 = {
-  M1_IN1,
-  M1_IN2,
-  &enc1,
-  1,
-  1,
-  0.0,
-  1.0,
-  5.0,
-  false,
-  0.0,
-  0.0,
-  0.0,
-  0.0,
-  0,
-  150,
-  255,
-  150,
-  0,
-  false
-};
+  "M1",
+  M1_IN1, M1_IN2, &enc1,
+  M1_ENC_SIGN, M1_MOT_SIGN,
 
+  0.56, 0.0, 0.005,
+  20.0,
+
+  150, 255, 150,
+  1.0, 10.0, 15000,
+
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0, 0.0,
+
+  false, false, false,
+  0
+};
 
 Motor m2 = {
-  M2_IN1,
-  M2_IN2,
-  &enc2,
-  1,
-  1,
-  0.0,
-  1.0,
-  5.0,
-  false,
-  0.0,
-  0.0,
-  0.0,
-  0.0,
-  0,
-  150,
-  255,
-  150,
-  0,
-  false
+  "M2",
+  M2_IN1, M2_IN2, &enc2,
+  M2_ENC_SIGN, M2_MOT_SIGN,
+
+  0.56, 0.0, 0.005,
+  20.0,
+
+  150, 255, 150,
+  1.0, 10.0, 15000,
+
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0, 0.0,
+
+  false, false, false,
+  0
 };
 
+// ---------------------
+// Runtime state
+// ---------------------
 
-// =====================================================
-// PID constants
-// =====================================================
-
-float kp = 1.75;
-float ki = 0.05;
-float kd = 0.0;
-
-const float U_FULL = 20.0;
-const float INTEGRAL_LIMIT = 300.0;
-
-const unsigned long TARGET_TIMEOUT_MS = 15000;
-
-
-// =====================================================
-// Manual motor constants
-// =====================================================
-
-const int MAN_PWM = 150;
-const unsigned long MANUAL_TIMEOUT_MS = 250;
-
+bool manMode = false;
 int manDir = 0;
-unsigned long lastManualMs = 0;
+int escState = 0;
 
+unsigned long lastCtrlUs = 0;
+unsigned long lastPrintMs = 0;
 
-// =====================================================
-// Trajectory constants
-// =====================================================
+// ======================================================
+// Function declarations
+// ======================================================
 
-bool trajOn = false;
-unsigned long trajStartMs = 0;
+Quat normQ(Quat q);
+Quat conjQ(Quat q);
+Quat mulQ(Quat a, Quat b);
+Quat fromBno(imu::Quaternion q);
+float angleQ(Quat q);
 
-const float TRAJ_FREQ = 0.05;
-const float TRAJ_CENTER_DEG = 45.0;
-const float TRAJ_AMP_DEG = 45.0;
+float filtJoint(float raw);
+void resetFilt(float start);
 
+bool imuStart();
+bool imuReady();
+void imuRead();
+void imuZero();
 
-// =====================================================
-// I2C scanner helper
-// =====================================================
+float axisVal();
+float errDeg(float target, float current);
 
-void scanBus(TwoWire& bus, const char* name) {
-  Serial.print("Scanning ");
-  Serial.println(name);
+long counts(Motor& m);
 
-  int found = 0;
+void drive(Motor& m, int dir, int pwm);
+void off(Motor& m);
+void hold(Motor& m);
 
-  for (byte address = 1; address < 127; address++) {
-    bus.beginTransmission(address);
-    byte error = bus.endTransmission();
+float sat1(float x);
+void pid(Motor& m, float dt, bool enabled);
 
-    if (error == 0) {
-      Serial.print("Found device on ");
-      Serial.print(name);
-      Serial.print(" at address 0x");
+bool motorEnabled(Motor& m);
+void resetMotor(Motor& m);
+void resetTargets();
+void setTarget(float deg);
 
-      if (address < 16) {
-        Serial.print("0");
-      }
+float calcTraj(float t);
+void startTraj();
+void stopTraj();
+void updateTraj();
 
-      Serial.println(address, HEX);
-      found++;
-    }
-  }
+void serialCheck();
+void handleChar(char c);
+void handleArrow(char c);
 
-  if (found == 0) {
-    Serial.print("No devices found on ");
-    Serial.println(name);
-  }
+void updateAll();
+void printQuat(const char* label, Quat q);
+void printData();
+void menu();
 
-  Serial.println();
-}
-
-
-// =====================================================
+// ======================================================
 // Quaternion math
-// =====================================================
+// ======================================================
 
-Q normQ(Q q) {
+Quat normQ(Quat q) {
   float n = sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
 
-  if (n < 1e-9) {
+  if (n < 0.000001) {
     return {1.0, 0.0, 0.0, 0.0};
   }
 
-  return {
-    q.w / n,
-    q.x / n,
-    q.y / n,
-    q.z / n
-  };
+  q.w /= n;
+  q.x /= n;
+  q.y /= n;
+  q.z /= n;
+
+  return q;
 }
 
-
-Q conjQ(Q q) {
+Quat conjQ(Quat q) {
   q = normQ(q);
+  return {q.w, -q.x, -q.y, -q.z};
+}
 
-  return {
-    q.w,
-    -q.x,
-    -q.y,
-    -q.z
+Quat mulQ(Quat a, Quat b) {
+  Quat q;
+
+  q.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+  q.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+  q.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+  q.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+
+  return normQ(q);
+}
+
+Quat fromBno(imu::Quaternion q) {
+  Quat out = {
+    (float)q.w(),
+    (float)q.x(),
+    (float)q.y(),
+    (float)q.z()
   };
+
+  return normQ(out);
 }
 
-
-Q mulQ(Q a, Q b) {
-  Q r;
-
-  r.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
-  r.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
-  r.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
-  r.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
-
-  return normQ(r);
-}
-
-
-float angleQ(Q q) {
+float angleQ(Quat q) {
   q = normQ(q);
 
   float w = fabs(q.w);
+  w = constrain(w, -1.0, 1.0);
 
-  if (w > 1.0) {
-    w = 1.0;
-  }
-
-  float angle = 2.0 * acos(w) * 180.0 / PI;
-
-  return angle;
+  return 2.0 * acos(w) * 180.0 / PI;
 }
 
+// ======================================================
+// IMU filter
+// ======================================================
 
-// =====================================================
-// IMU angle filtering
-// =====================================================
-
-void resetFilt(float value) {
-  filtAng = value;
-  filtInit = true;
-}
-
-
-float filtJoint(float rawAngle) {
-  if (!filtInit) {
-    resetFilt(rawAngle);
-    return rawAngle;
+float filtJoint(float raw) {
+  if (!filtOn) {
+    resetFilt(raw);
+    return raw;
   }
 
-  float diff = rawAngle - filtAng;
+  float jump = fabs(raw - filtAng);
+  float dAvg = raw - avgAng;
+  float instVar = dAvg * dAvg;
 
-  if (fabs(diff) > SPIKE_LIMIT_DEG) {
+  float vLim = varAng * 3.0;
+
+  if (vLim < VAR_MAX) {
+    vLim = VAR_MAX;
+  }
+
+  bool spike = (jump > JMP_MAX) && (instVar > vLim);
+
+  if (spike) {
+    rejSpks++;
+    filtAng = goodAng;
     return filtAng;
   }
 
-  filtAng = FILTER_ALPHA * rawAngle + (1.0 - FILTER_ALPHA) * filtAng;
+  avgAng = AVG_A * raw + (1.0 - AVG_A) * avgAng;
+
+  float dNew = raw - avgAng;
+  float newVar = dNew * dNew;
+
+  varAng = VAR_A * newVar + (1.0 - VAR_A) * varAng;
+
+  filtAng = FILT_A * raw + (1.0 - FILT_A) * filtAng;
+  goodAng = filtAng;
 
   return filtAng;
 }
 
+void resetFilt(float start) {
+  rawAng = start;
+  filtAng = start;
+  avgAng = start;
+  varAng = 0.0;
+  goodAng = start;
+  filtOn = true;
+  rejSpks = 0;
+}
 
-// =====================================================
+// ======================================================
 // IMU functions
-// =====================================================
+// ======================================================
 
 bool imuStart() {
   Wire.begin();
   Wire1.begin();
 
-  // Slower I2C is safer for the BNO055.
-  Wire.setClock(100000);
-  Wire1.setClock(100000);
+  delay(100);
 
-  delay(500);
+  bool upOk = bnoUpper.begin();
+  bool foreOk = bnoForearm.begin();
 
-  scanBus(Wire, "Wire");
-  scanBus(Wire1, "Wire1");
-
-  bool upperOk = false;
-  bool forearmOk = false;
-
-  for (int i = 0; i < 5; i++) {
-    if (!upperOk) {
-      upperOk = bnoUpper.begin();
-    }
-
-    if (!forearmOk) {
-      forearmOk = bnoForearm.begin();
-    }
-
-    if (upperOk && forearmOk) {
-      break;
-    }
-
-    Serial.println("Retrying IMU startup...");
-    delay(500);
+  if (!upOk) {
+    Serial.println("ERROR: Upper BNO055 not detected.");
   }
 
-  if (!upperOk) {
-    Serial.println("ERROR: Upper IMU not detected.");
+  if (!foreOk) {
+    Serial.println("ERROR: Forearm BNO055 not detected.");
   }
 
-  if (!forearmOk) {
-    Serial.println("ERROR: Forearm IMU not detected.");
-    Serial.println("Check that forearm IMU SDA is on pin 17 and SCL is on pin 16.");
-    Serial.println("If scanner shows 0x29 on Wire1, change the forearm address to 0x29.");
-  }
-
-  if (!upperOk || !forearmOk) {
+  if (!upOk || !foreOk) {
     imuOk = false;
-    lastImuReadOk = false;
     return false;
   }
 
@@ -406,71 +395,36 @@ bool imuStart() {
   bnoUpper.setExtCrystalUse(true);
   bnoForearm.setExtCrystalUse(true);
 
-  delay(500);
-
   imuOk = true;
-  lastImuReadOk = true;
 
-  Serial.println("IMUs started.");
+  imuRead();
+  imuZero();
+
+  Serial.println("IMUs started and zeroed.");
 
   return true;
 }
-
 
 bool imuReady() {
-  return imuOk && lastImuReadOk;
+  return imuOk;
 }
 
-
-bool imuReadRaw(Q& qUpperRaw, Q& qForearmRaw) {
+void imuRead() {
   if (!imuOk) {
-    lastImuReadOk = false;
-    return false;
+    return;
   }
 
-  imu::Quaternion rawUpper = bnoUpper.getQuat();
-  imu::Quaternion rawForearm = bnoForearm.getQuat();
+  qUpRaw = fromBno(bnoUpper.getQuat());
+  qForeRaw = fromBno(bnoForearm.getQuat());
 
-  Q upperTemp = {
-    (float)rawUpper.w(),
-    (float)rawUpper.x(),
-    (float)rawUpper.y(),
-    (float)rawUpper.z()
-  };
+  qUpZeroed = mulQ(conjQ(qUpZero), qUpRaw);
+  qForeZeroed = mulQ(conjQ(qForeZero), qForeRaw);
 
-  Q forearmTemp = {
-    (float)rawForearm.w(),
-    (float)rawForearm.x(),
-    (float)rawForearm.y(),
-    (float)rawForearm.z()
-  };
+  qJointZeroed = mulQ(conjQ(qUpZeroed), qForeZeroed);
 
-  float upperNorm = sqrt(
-    upperTemp.w * upperTemp.w +
-    upperTemp.x * upperTemp.x +
-    upperTemp.y * upperTemp.y +
-    upperTemp.z * upperTemp.z
-  );
-
-  float forearmNorm = sqrt(
-    forearmTemp.w * forearmTemp.w +
-    forearmTemp.x * forearmTemp.x +
-    forearmTemp.y * forearmTemp.y +
-    forearmTemp.z * forearmTemp.z
-  );
-
-  if (upperNorm < 0.5 || forearmNorm < 0.5) {
-    lastImuReadOk = false;
-    return false;
-  }
-
-  qUpperRaw = normQ(upperTemp);
-  qForearmRaw = normQ(forearmTemp);
-
-  lastImuReadOk = true;
-  return true;
+  rawAng = angleQ(qJointZeroed);
+  ang = filtJoint(rawAng);
 }
-
 
 void imuZero() {
   if (!imuOk) {
@@ -478,78 +432,236 @@ void imuZero() {
     return;
   }
 
-  Q qUpperRaw;
-  Q qForearmRaw;
+  qUpRaw = fromBno(bnoUpper.getQuat());
+  qForeRaw = fromBno(bnoForearm.getQuat());
 
-  bool readOk = false;
+  qUpZero = qUpRaw;
+  qForeZero = qForeRaw;
 
-  for (int i = 0; i < 10; i++) {
-    if (imuReadRaw(qUpperRaw, qForearmRaw)) {
-      readOk = true;
-      break;
-    }
-
-    delay(20);
-  }
-
-  if (!readOk) {
-    Serial.println("Cannot zero IMUs. Bad quaternion read.");
-    lastImuReadOk = false;
-    return;
-  }
-
-  qUpperZero = qUpperRaw;
-  qForearmZero = qForearmRaw;
-
-  qUpperZeroed = {1.0, 0.0, 0.0, 0.0};
-  qForearmZeroed = {1.0, 0.0, 0.0, 0.0};
+  qUpZeroed = {1.0, 0.0, 0.0, 0.0};
+  qForeZeroed = {1.0, 0.0, 0.0, 0.0};
   qJointZeroed = {1.0, 0.0, 0.0, 0.0};
 
   rawAng = 0.0;
   ang = 0.0;
+
   resetFilt(0.0);
+  resetTargets();
 
-  enc1.write(0);
-  enc2.write(0);
-
-  lastImuReadOk = true;
-
-  Serial.println("IMUs and encoders zeroed.");
+  Serial.println("IMU recalibrated. Current joint angle is now 0.");
 }
 
+// ======================================================
+// Angle helpers
+// ======================================================
 
-bool imuRead() {
-  if (!imuOk) {
-    lastImuReadOk = false;
-    return false;
-  }
-
-  Q qUpperRaw;
-  Q qForearmRaw;
-
-  bool readOk = imuReadRaw(qUpperRaw, qForearmRaw);
-
-  if (!readOk) {
-    return false;
-  }
-
-  qUpperZeroed = mulQ(conjQ(qUpperZero), qUpperRaw);
-  qForearmZeroed = mulQ(conjQ(qForearmZero), qForearmRaw);
-
-  qJointZeroed = mulQ(conjQ(qUpperZeroed), qForearmZeroed);
-
-  rawAng = angleQ(qJointZeroed);
-  ang = filtJoint(rawAng);
-
-  lastImuReadOk = true;
-
-  return true;
+float axisVal() {
+  return ang;
 }
 
+float errDeg(float target, float current) {
+  return target - current;
+}
 
-// =====================================================
-// Motor helper functions
-// =====================================================
+// ======================================================
+// Motor helpers
+// ======================================================
+
+long counts(Motor& m) {
+  return m.encSign * m.enc->read();
+}
+
+void drive(Motor& m, int dir, int pwm) {
+  pwm = constrain(pwm, 0, 255);
+
+  if (pwm <= 0 || dir == 0) {
+    off(m);
+    return;
+  }
+
+  if (dir > 0) {
+    analogWrite(m.in1, pwm);
+    analogWrite(m.in2, 0);
+  } else {
+    analogWrite(m.in1, 0);
+    analogWrite(m.in2, pwm);
+  }
+}
+
+void off(Motor& m) {
+  analogWrite(m.in1, 0);
+  analogWrite(m.in2, 0);
+}
+
+void hold(Motor& m) {
+  analogWrite(m.in1, 255);
+  analogWrite(m.in2, 255);
+}
+
+float sat1(float x) {
+  if (x < 0.0) {
+    return 0.0;
+  }
+
+  if (x > 1.0) {
+    return 1.0;
+  }
+
+  return x;
+}
+
+// ======================================================
+// PID controller
+// ======================================================
+
+void pid(Motor& m, float dt, bool enabled) {
+  if (!imuReady() || !enabled) {
+    off(m);
+    resetMotor(m);
+    return;
+  }
+
+  if (!m.active) {
+    off(m);
+    m.lastUNorm = 0.0;
+    m.lastPwm = 0;
+    m.lastU = 0.0;
+    return;
+  }
+
+  float current = axisVal();
+  float error = errDeg(m.target, current);
+  float absErr = fabs(error);
+
+  bool trajMode = trajOn && (&m == &m2);
+
+  bool errFlip =
+      (error > 0.0 && m.lastErr < 0.0) ||
+      (error < 0.0 && m.lastErr > 0.0);
+
+  if (errFlip) {
+    m.sumErr = 0.0;
+  }
+
+  bool atTarget = false;
+
+  if (!trajMode) {
+    float exitTol = m.tol * 1.5;
+    atTarget = m.holding ? (absErr <= exitTol) : (absErr <= m.tol);
+  }
+
+  if (atTarget) {
+    hold(m);
+
+    m.lastUNorm = 0.0;
+    m.lastPwm = 0;
+    m.lastU = 0.0;
+
+    m.sumErr = 0.0;
+    m.lastErr = error;
+    m.lastMeas = current;
+    m.lastOut = 0.0;
+
+    m.holding = true;
+    m.startMs = millis();
+
+    if (!m.printed) {
+      Serial.print(m.name);
+      Serial.println(" reached target.");
+      m.printed = true;
+    }
+
+    return;
+  }
+
+  if (m.holding) {
+    m.holding = false;
+    m.printed = false;
+
+    m.sumErr = 0.0;
+    m.lastErr = error;
+    m.lastMeas = current;
+    m.lastOut = 0.0;
+    m.lastU = 0.0;
+    m.startMs = millis();
+
+    Serial.print(m.name);
+    Serial.println(" moved away from target. PID re-engaging.");
+  }
+
+  if (!trajMode && millis() - m.startMs > m.timeout) {
+    Serial.print(m.name);
+    Serial.println(" timeout. Motor stopped.");
+
+    off(m);
+    resetMotor(m);
+    return;
+  }
+
+  int pwmLimit = m.maxPwm;
+
+  if (absErr <= m.slowZone) {
+    pwmLimit = m.slowPwm;
+  }
+
+  float dMeas = (current - m.lastMeas) / dt;
+  float dErr = -dMeas;
+
+  bool saturated =
+      (fabs(m.lastOut) >= fabs(m.uFull)) &&
+      ((m.lastOut > 0.0) == (error > 0.0));
+
+  if (!saturated) {
+    m.sumErr += error * dt;
+  }
+
+  if (fabs(m.ki) > 0.000001) {
+    float iLimit = fabs(m.uFull / m.ki);
+    m.sumErr = constrain(m.sumErr, -iLimit, iLimit);
+  } else {
+    m.sumErr = 0.0;
+  }
+
+  float out =
+      m.kp * error +
+      m.kd * dErr +
+      m.ki * m.sumErr;
+
+  m.lastErr = error;
+  m.lastMeas = current;
+  m.lastOut = out;
+
+  float uFull = fabs(m.uFull);
+
+  if (uFull < 0.000001) {
+    uFull = 1.0;
+  }
+
+  float uNorm = sat1(fabs(out) / uFull);
+  int pwmMin = min(m.minPwm, pwmLimit);
+  int pwm = pwmMin + (int)((pwmLimit - pwmMin) * uNorm);
+
+  if (fabs(out) < 0.0001) {
+    pwm = 0;
+    uNorm = 0.0;
+  }
+
+  int dir = (out >= 0.0) ? FWD : REV;
+
+  // Correct plant input signal:
+  // This is the signed PWM command actually sent to the motor driver.
+  float uCmd = dir * m.motSign * pwm;
+
+  m.lastUNorm = uNorm;
+  m.lastPwm = pwm;
+  m.lastU = uCmd;
+
+  drive(m, dir * m.motSign, pwm);
+}
+
+// ======================================================
+// Target, reset, and trajectory
+// ======================================================
 
 bool motorEnabled(Motor& m) {
   if (&m == &m1) {
@@ -563,108 +675,104 @@ bool motorEnabled(Motor& m) {
   return false;
 }
 
-
-float axisVal() {
-  return ang;
-}
-
-
-float errDeg(float target, float current) {
-  return target - current;
-}
-
-
-long counts(Motor& m) {
-  return m.encSign * m.enc->read();
-}
-
-
-void drive(Motor& m, int dir, int pwm) {
-  pwm = constrain(pwm, 0, 195);
-
-  if (dir > 0) {
-    analogWrite(m.in1, pwm);
-    analogWrite(m.in2, 0);
-  }
-  else if (dir < 0) {
-    analogWrite(m.in1, 0);
-    analogWrite(m.in2, pwm);
-  }
-  else {
-    analogWrite(m.in1, 0);
-    analogWrite(m.in2, 0);
-  }
-}
-
-
-void off(Motor& m) {
-  analogWrite(m.in1, 0);
-  analogWrite(m.in2, 0);
-
-  m.lastPwm = 0;
-  m.lastUNorm = 0.0;
-  m.lastU = 0.0;
+void resetMotor(Motor& m) {
+  m.active = false;
   m.holding = false;
-}
+  m.printed = false;
 
-
-void hold(Motor& m) {
-  analogWrite(m.in1, 255);
-  analogWrite(m.in2, 255);
-
-  m.lastPwm = 0;
-  m.lastUNorm = 0.0;
-  m.lastU = 0.0;
-  m.holding = true;
-}
-
-
-void resetMotorControl(Motor& m) {
-  m.integ = 0.0;
   m.lastErr = 0.0;
-  m.lastPwm = 0;
+  m.sumErr = 0.0;
+  m.lastMeas = axisVal();
+  m.lastOut = 0.0;
+
   m.lastUNorm = 0.0;
+  m.lastPwm = 0;
   m.lastU = 0.0;
-  m.startMs = millis();
-  m.holding = false;
 }
 
+void resetTargets() {
+  stopTraj();
 
-// =====================================================
-// Trajectory functions
-// =====================================================
+  resetMotor(m1);
+  resetMotor(m2);
+
+  m1.target = axisVal();
+  m2.target = axisVal();
+
+  manMode = false;
+  manDir = 0;
+
+  off(m1);
+  off(m2);
+}
+
+void setTarget(float deg) {
+  stopTraj();
+
+  manMode = false;
+  manDir = 0;
+
+  float current = axisVal();
+
+  m2.target = deg;
+  m2.active = true;
+  m2.holding = false;
+  m2.printed = false;
+
+  m2.lastErr = errDeg(m2.target, current);
+  m2.sumErr = 0.0;
+  m2.lastMeas = current;
+  m2.lastOut = 0.0;
+  m2.lastUNorm = 0.0;
+  m2.lastPwm = 0;
+  m2.lastU = 0.0;
+  m2.startMs = millis();
+
+  Serial.print("New Motor 2 target: ");
+  Serial.print(deg, 2);
+  Serial.println(" deg");
+}
 
 float calcTraj(float t) {
   return TRAJ_CENTER_DEG
          - TRAJ_AMP_DEG * cos(2.0 * PI * TRAJ_FREQ * t - 2.0 * PI);
 }
 
-
 void startTraj() {
+  manMode = false;
   manDir = 0;
-  off(m2);
 
   trajOn = true;
   trajStartMs = millis();
 
+  float current = axisVal();
+
+  m2.target = calcTraj(0.0);
   m2.active = true;
-  resetMotorControl(m2);
+  m2.holding = false;
+  m2.printed = false;
 
-  Serial.println("Trajectory started.");
+  m2.lastErr = errDeg(m2.target, current);
+  m2.sumErr = 0.0;
+  m2.lastMeas = current;
+  m2.lastOut = 0.0;
+  m2.lastUNorm = 0.0;
+  m2.lastPwm = 0;
+  m2.lastU = 0.0;
+  m2.startMs = millis();
+
+  Serial.print("Sinusoidal trajectory started. Frequency: ");
+  Serial.print(TRAJ_FREQ, 3);
+  Serial.println(" Hz");
 }
-
 
 void stopTraj() {
   trajOn = false;
-  m2.active = false;
-  off(m2);
-
-  Serial.println("Trajectory stopped.");
+  trajStartMs = 0;
 }
 
-
 void updateTraj() {
-  if (!trajOn) {
+  if (!trajOn || manMode) {
     return;
   }
 
@@ -672,236 +780,33 @@ void updateTraj() {
 
   m2.target = calcTraj(t);
   m2.active = true;
-}
 
-
-// =====================================================
-// Target control
-// =====================================================
-
-void setTarget(float targetDeg) {
-  trajOn = false;
-  manDir = 0;
-
-  m2.target = targetDeg;
-  m2.active = true;
-
-  resetMotorControl(m2);
-
-  Serial.print("New target: ");
-  Serial.print(targetDeg);
-  Serial.println(" deg");
-}
-
-
-void stopAll() {
-  trajOn = false;
-  manDir = 0;
-
-  m1.active = false;
-  m2.active = false;
-
-  off(m1);
-  off(m2);
-
-  Serial.println("Motors stopped.");
-}
-
-
-// =====================================================
-// Manual control
-// =====================================================
-
-void manualM2(int dir) {
-  trajOn = false;
-
-  manDir = dir;
-  lastManualMs = millis();
-
-  m2.active = false;
   m2.holding = false;
-
-  int actualDir = dir * m2.motSign;
-
-  m2.lastPwm = MAN_PWM;
-  m2.lastUNorm = (float)MAN_PWM / 255.0;
-  m2.lastU = actualDir * MAN_PWM;
-
-  drive(m2, actualDir, MAN_PWM);
+  m2.printed = false;
 }
 
+// ======================================================
+// Serial commands
+// ======================================================
 
-void updateManualTimeout() {
-  if (manDir == 0) {
-    return;
-  }
+void serialCheck() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
 
-  if (millis() - lastManualMs > MANUAL_TIMEOUT_MS) {
-    manDir = 0;
-    off(m2);
-  }
-}
-
-
-// =====================================================
-// PID control
-// =====================================================
-
-void pid(Motor& m, float dt) {
-  if (!imuReady() || !motorEnabled(m)) {
-    off(m);
-    return;
-  }
-
-  if (&m == &m2 && manDir != 0) {
-    return;
-  }
-
-  if (!m.active) {
-    return;
-  }
-
-  bool trajMode = trajOn && (&m == &m2);
-
-  float current = axisVal();
-  float e = errDeg(m.target, current);
-
-  if (!trajMode && fabs(e) <= m.tol) {
-    m.active = false;
-    hold(m);
-    return;
-  }
-
-  if (!trajMode && millis() - m.startMs > TARGET_TIMEOUT_MS) {
-    m.active = false;
-    off(m);
-    Serial.println("Target timeout.");
-    return;
-  }
-
-  m.integ += e * dt;
-  m.integ = constrain(m.integ, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
-
-  float de = 0.0;
-
-  if (dt > 1e-4) {
-    de = (e - m.lastErr) / dt;
-  }
-
-  float out = kp * e + ki * m.integ + kd * de;
-
-  m.lastErr = e;
-
-  float absOut = fabs(out);
-
-  if (absOut < 1e-5) {
-    off(m);
-    return;
-  }
-
-  float uNorm = absOut / U_FULL;
-  uNorm = constrain(uNorm, 0.0, 1.0);
-
-  int pwm = m.minPwm + (int)((m.maxPwm - m.minPwm) * uNorm);
-  pwm = constrain(pwm, m.minPwm, m.maxPwm);
-
-  if (!trajMode && fabs(e) < m.slowZone) {
-    pwm = m.slowPwm;
-  }
-
-  int dir = (out >= 0.0) ? FWD : REV;
-
-  int actualDir = dir * m.motSign;
-
-  m.lastPwm = pwm;
-  m.lastUNorm = (float)pwm / 255.0;
-  m.lastU = actualDir * pwm;
-
-  drive(m, actualDir, pwm);
-}
-
-
-// =====================================================
-// Serial print functions
-// =====================================================
-
-void printQ(const char* label, Q q) {
-  Serial.print(label);
-  Serial.print(": ");
-  Serial.print(q.w, 6);
-  Serial.print(",");
-  Serial.print(q.x, 6);
-  Serial.print(",");
-  Serial.print(q.y, 6);
-  Serial.print(",");
-  Serial.println(q.z, 6);
-}
-
-
-void printData() {
-  static unsigned long lastDataPrint = 0;
-  static unsigned long lastQuatPrint = 0;
-
-  unsigned long now = millis();
-
-  if (PRINT_FAST_DATA && now - lastDataPrint >= DATA_INTERVAL_MS) {
-    lastDataPrint = now;
-
-    Serial.print("DATA,");
-    Serial.print(now);
-    Serial.print(",");
-    Serial.print(axisVal(), 4);
-    Serial.print(",");
-    Serial.print(counts(m1));
-    Serial.print(",");
-    Serial.println(counts(m2));
-  }
-
-  if (PRINT_QUATERNIONS_SLOW && now - lastQuatPrint >= QUAT_INTERVAL_MS) {
-    lastQuatPrint = now;
-
-    printQ("qUpperZeroed", qUpperZeroed);
-    printQ("qForearmZeroed", qForearmZeroed);
-    printQ("qJointZeroed", qJointZeroed);
+    if (escState == 0) {
+      if (c == 27) {
+        escState = 1;
+      } else {
+        handleChar(c);
+      }
+    } else if (escState == 1) {
+      escState = (c == '[') ? 2 : 0;
+    } else if (escState == 2) {
+      handleArrow(c);
+      escState = 0;
+    }
   }
 }
-
-
-// =====================================================
-// Menu and serial commands
-// =====================================================
-
-void printMenu() {
-  Serial.println();
-  Serial.println("Commands:");
-  Serial.println("  0-9  : set target angle");
-  Serial.println("         0 = 5 deg");
-  Serial.println("         1 = 10 deg");
-  Serial.println("         2 = 20 deg");
-  Serial.println("         ...");
-  Serial.println("         9 = 90 deg");
-  Serial.println("  x    : start/stop sinusoidal trajectory");
-  Serial.println("  left : manual reverse Motor 2");
-  Serial.println("  right: manual forward Motor 2");
-  Serial.println("  s/p  : stop motor");
-  Serial.println("  r    : reset IMU zero and encoder counts");
-  Serial.println("  m    : print menu");
-  Serial.println();
-  Serial.println("Fast data format:");
-  Serial.println("  DATA,time_ms,theta_deg,m1_counts,m2_counts");
-  Serial.println();
-}
-
-
-void handleArrow(char arrowChar) {
-  if (arrowChar == 'D') {
-    manualM2(REV);
-  }
-  else if (arrowChar == 'C') {
-    manualM2(FWD);
-  }
-}
-
 
 void handleChar(char c) {
   if (c == '\n' || c == '\r') {
@@ -910,138 +815,277 @@ void handleChar(char c) {
 
   if (isdigit(c)) {
     int digit = c - '0';
-
-    float targetDeg;
-
-    if (digit == 0) {
-      targetDeg = 5.0;
-    }
-    else {
-      targetDeg = digit * 10.0;
-    }
-
-    setTarget(targetDeg);
+    setTarget(KEY_TGTS[digit]);
     return;
   }
 
   if (c == 'x' || c == 'X') {
     if (trajOn) {
-      stopTraj();
-    }
-    else {
+      Serial.println("Sinusoidal trajectory stopped.");
+      resetTargets();
+    } else {
       startTraj();
     }
 
     return;
   }
 
-  if (c == 's' || c == 'S' || c == 'p' || c == 'P') {
-    stopAll();
+  if (c == 's' || c == 'p') {
+    Serial.println("Stop command received.");
+    resetTargets();
     return;
   }
 
-  if (c == 'r' || c == 'R') {
+  if (c == 'r') {
+    Serial.println("Recalibrating IMUs...");
+    resetTargets();
     imuZero();
     return;
   }
 
-  if (c == 'm' || c == 'M') {
-    printMenu();
+  if (c == 'm') {
+    menu();
     return;
   }
+
+  Serial.print("Unknown command: ");
+  Serial.println(c);
 }
 
+void handleArrow(char c) {
+  stopTraj();
 
-void serialCheck() {
-  static int escState = 0;
+  if (c == 'D') {
+    manMode = true;
+    manDir = REV;
 
-  while (Serial.available()) {
-    char c = Serial.read();
+    m2.active = false;
+    m2.holding = false;
+    m2.printed = false;
 
-    if (escState == 0) {
-      if (c == 27) {
-        escState = 1;
-      }
-      else {
-        handleChar(c);
-      }
-    }
-    else if (escState == 1) {
-      if (c == '[') {
-        escState = 2;
-      }
-      else {
-        escState = 0;
-      }
-    }
-    else if (escState == 2) {
-      handleArrow(c);
-      escState = 0;
-    }
+    Serial.println("Manual mode: Motor 2 reverse");
+  } else if (c == 'C') {
+    manMode = true;
+    manDir = FWD;
+
+    m2.active = false;
+    m2.holding = false;
+    m2.printed = false;
+
+    Serial.println("Manual mode: Motor 2 forward");
   }
 }
 
+// ======================================================
+// Main update
+// ======================================================
 
-// =====================================================
+void updateAll() {
+  serialCheck();
+
+  unsigned long nowUs = micros();
+
+  if (nowUs - lastCtrlUs < CTRL_US) {
+    return;
+  }
+
+  float dt = (nowUs - lastCtrlUs) / 1000000.0;
+  lastCtrlUs = nowUs;
+
+  if (dt <= 0.0) {
+    dt = CTRL_US / 1000000.0;
+  }
+
+  if (dt > 0.05) {
+    dt = 0.05;
+  }
+
+  imuRead();
+
+  static bool wasMan = false;
+
+  if (manMode) {
+    off(m1);
+
+    drive(m2, manDir * m2.motSign, MAN_PWM);
+
+    m2.lastPwm = MAN_PWM;
+    m2.lastUNorm = (float)MAN_PWM / (float)m2.maxPwm;
+
+    // Correct signed manual command.
+    m2.lastU = manDir * m2.motSign * MAN_PWM;
+
+    if (m2.lastUNorm > 1.0) {
+      m2.lastUNorm = 1.0;
+    }
+
+    printData();
+
+    wasMan = true;
+    return;
+  }
+
+  if (wasMan) {
+    float current = axisVal();
+
+    m2.lastErr = errDeg(m2.target, current);
+    m2.sumErr = 0.0;
+    m2.lastMeas = current;
+    m2.lastOut = 0.0;
+    m2.lastUNorm = 0.0;
+    m2.lastPwm = 0;
+    m2.lastU = 0.0;
+    m2.holding = false;
+    m2.printed = false;
+    m2.startMs = millis();
+
+    wasMan = false;
+  }
+
+  updateTraj();
+
+  pid(m1, dt, motorEnabled(m1));
+  pid(m2, dt, motorEnabled(m2));
+
+  printData();
+}
+
+// ======================================================
+// Printing
+// ======================================================
+
+void printQuat(const char* label, Quat q) {
+  Serial.print(label);
+  Serial.print(": ");
+  Serial.print(q.w, 6);
+  Serial.print(", ");
+  Serial.print(q.x, 6);
+  Serial.print(", ");
+  Serial.print(q.y, 6);
+  Serial.print(", ");
+  Serial.println(q.z, 6);
+}
+
+void printData() {
+  if (millis() - lastPrintMs < PRINT_MS) {
+    return;
+  }
+
+  lastPrintMs = millis();
+
+  float targetDeg = manMode ? axisVal() : m2.target;
+  float currentDeg = axisVal();
+  float errorDeg = manMode ? 0.0 : errDeg(targetDeg, currentDeg);
+
+  Serial.print("\nTargetDeg: ");
+  Serial.print(targetDeg, 2);
+
+  Serial.print(" | CurrentDeg: ");
+  Serial.print(currentDeg, 2);
+
+  Serial.print(" | RawDeg: ");
+  Serial.print(rawAng, 2);
+
+  Serial.print(" | RejectedSpikes: ");
+  Serial.print(rejSpks);
+
+  Serial.print(" | ErrorDeg: ");
+  Serial.print(errorDeg, 2);
+
+  Serial.print(" | PWMNorm: ");
+  Serial.print(m2.lastUNorm, 3);
+
+  Serial.print(" | PWM: ");
+  Serial.print(m2.lastPwm);
+
+  Serial.print(" | UCmd: ");
+  Serial.print(m2.lastU, 3);
+
+  Serial.print(" | Mode: ");
+
+  if (manMode) {
+    Serial.print("Manual");
+  } else if (trajOn) {
+    Serial.print("Traj");
+  } else if (m2.active) {
+    Serial.print("PID");
+  } else {
+    Serial.print("Idle");
+  }
+
+  Serial.print(" | FreqHz: ");
+  Serial.print(TRAJ_FREQ, 3);
+
+  Serial.print(" | M1Counts: ");
+  Serial.print(counts(m1));
+
+  Serial.print(" | M2Counts: ");
+  Serial.println(counts(m2));
+
+  printQuat("qUpperZeroed", qUpZeroed);
+  printQuat("qForearmZeroed", qForeZeroed);
+  printQuat("qJointZeroed", qJointZeroed);
+}
+
+// ======================================================
+// Menu
+// ======================================================
+
+void menu() {
+  Serial.println();
+  Serial.println("========== MENU ==========");
+  Serial.println("0-9  : Move Motor 2 to selected target");
+  Serial.println("0 = 5 deg");
+  Serial.println("1 = 10 deg");
+  Serial.println("2 = 20 deg");
+  Serial.println("3 = 30 deg");
+  Serial.println("4 = 40 deg");
+  Serial.println("5 = 50 deg");
+  Serial.println("6 = 60 deg");
+  Serial.println("7 = 70 deg");
+  Serial.println("8 = 80 deg");
+  Serial.println("9 = 90 deg");
+  Serial.println("x    : Start/stop sinusoidal trajectory");
+  Serial.println("Left : Manual Motor 2 reverse");
+  Serial.println("Right: Manual Motor 2 forward");
+  Serial.println("s/p  : Stop motor");
+  Serial.println("r    : Recalibrate / zero IMUs");
+  Serial.println("m    : Print menu");
+  Serial.println("==========================");
+  Serial.println();
+}
+
+// ======================================================
 // Setup and loop
-// =====================================================
+// ======================================================
 
 void setup() {
   Serial.begin(115200);
-
-  // Longer delay gives the BNO055 more time to power up.
-  delay(2500);
 
   pinMode(M1_IN1, OUTPUT);
   pinMode(M1_IN2, OUTPUT);
   pinMode(M2_IN1, OUTPUT);
   pinMode(M2_IN2, OUTPUT);
 
-  analogWriteResolution(8);
-
   off(m1);
   off(m2);
 
-  Serial.println("Starting elbow controller...");
+  delay(1500);
 
-  bool started = imuStart();
+  Serial.println("Starting dual IMU elbow controller...");
 
-  if (!started) {
-    Serial.println("IMU start failed. Check wiring.");
-    while (1) {
-      delay(1000);
-    }
+  if (!imuStart()) {
+    Serial.println("IMU startup failed. Check wiring.");
   }
 
-  imuZero();
+  resetTargets();
 
-  printMenu();
+  lastCtrlUs = micros();
+  lastPrintMs = millis();
 
-  Serial.println("Controller ready.");
+  menu();
 }
 
-
 void loop() {
-  static unsigned long lastLoopUs = micros();
-
-  unsigned long nowUs = micros();
-  float dt = (nowUs - lastLoopUs) / 1000000.0;
-  lastLoopUs = nowUs;
-
-  if (dt <= 0.0 || dt > 0.2) {
-    dt = 0.01;
-  }
-
-  serialCheck();
-
-  imuRead();
-
-  updateTraj();
-
-  updateManualTimeout();
-
-  pid(m1, dt);
-  pid(m2, dt);
-
-  printData();
+  updateAll();
 }
