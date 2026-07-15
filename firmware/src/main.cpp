@@ -95,7 +95,7 @@ const int M2_MOT_SIGN = 1;
 const int MAN_PWM = 125;
 
 const unsigned long CTRL_US = 10000;
-const unsigned long PRINT_MS = 200;
+const unsigned long PRINT_MS = 20;
 
 const float KEY_TGTS[10] = {
   5.0, 10.0, 20.0, 30.0, 40.0,
@@ -167,11 +167,11 @@ Motor m1 = {
   M1_IN1, M1_IN2, &enc1,
   M1_ENC_SIGN, M1_MOT_SIGN,
 
-  0.56, 0.0, 0.005,
+  0.9, 0.0, 0.05,
   20.0,
 
   150, 255, 150,
-  1.0, 10.0, 15000,
+  1.0, 5.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
   0.0, 0, 0.0,
@@ -185,11 +185,11 @@ Motor m2 = {
   M2_IN1, M2_IN2, &enc2,
   M2_ENC_SIGN, M2_MOT_SIGN,
 
-  0.56, 0.0, 0.005,
+  0.9, 0.0, .05  ,
   20.0,
 
   150, 255, 150,
-  1.0, 10.0, 15000,
+  1.0, 5.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
   0.0, 0, 0.0,
