@@ -8,10 +8,10 @@
 #include <utility/imumaths.h>
 
 // ======================================================
-// Dual BNO055 IMU + Motor 2 PID Control
-// IMU spike rejection + low-pass filtering
-// Sinusoidal trajectory mode
-// Correct UCmd = signed PWM command for graphing/system ID
+// Dual BNO055 IMU + Motor 2 Control
+// Working reference structure kept
+// Adds constant-PWM 0 -> 90 -> 0 trial mode
+// Adds trial timing, DATA lines for CSV, and emergency manual control
 // ======================================================
 
 // ---------------------
@@ -119,6 +119,31 @@ const float TRAJ_AMP_DEG = 45.0;
 unsigned long trajStartMs = 0;
 
 // ---------------------
+// Constant PWM trial settings
+// ---------------------
+
+// Press n to start one trial: reset -> 0 -> 90 -> 0.
+// Tune this PWM for your system.
+int TRIAL_PWM = 255;
+
+const float TRIAL_TOP_DEG = 90.0;
+const float TRIAL_BOTTOM_DEG = 0.0;
+const float TRIAL_TOL_DEG = 2.0;
+
+// Wait after reset before the motor starts moving.
+const unsigned long TRIAL_START_DELAY_MS = 1000;
+
+// Pause at the top before returning to 0.
+const unsigned long TRIAL_TOP_PAUSE_MS = 250;
+
+// Safety timeout for one full 0 -> 90 -> 0 trial.
+const unsigned long TRIAL_TIMEOUT_MS = 30000;
+
+// Change these signs if the automatic trial moves the wrong way.
+const int TRIAL_UP_DIR = FWD;
+const int TRIAL_DOWN_DIR = REV;
+
+// ---------------------
 // Motor struct
 // ---------------------
 
@@ -206,6 +231,28 @@ bool manMode = false;
 int manDir = 0;
 int escState = 0;
 
+// Constant PWM trial state
+enum TrialState {
+  TRIAL_IDLE,
+  TRIAL_WAITING,
+  TRIAL_MOVING_UP,
+  TRIAL_PAUSE_TOP,
+  TRIAL_MOVING_DOWN,
+  TRIAL_DONE
+};
+
+TrialState trialState = TRIAL_IDLE;
+unsigned int trialId = 0;
+
+unsigned long trialStartMs = 0;
+unsigned long trialMotionStartMs = 0;
+unsigned long trialReached90Ms = 0;
+unsigned long trialReached0Ms = 0;
+unsigned long trialTopPauseStartMs = 0;
+
+long trialCountsAt90 = 0;
+long trialCountsAt0 = 0;
+
 unsigned long lastCtrlUs = 0;
 unsigned long lastPrintMs = 0;
 
@@ -248,6 +295,14 @@ float calcTraj(float t);
 void startTraj();
 void stopTraj();
 void updateTraj();
+
+const char* trialStateName();
+bool trialIsRunning();
+void resetTrialOnly();
+void startConstantPwmTrial();
+bool updateConstantPwmTrial();
+void driveTrialMotor(int dir, int pwm);
+void emergencyStop(const char* reason);
 
 void serialCheck();
 void handleChar(char c);
@@ -692,6 +747,7 @@ void resetMotor(Motor& m) {
 
 void resetTargets() {
   stopTraj();
+  resetTrialOnly();
 
   resetMotor(m1);
   resetMotor(m2);
@@ -785,6 +841,292 @@ void updateTraj() {
   m2.printed = false;
 }
 
+
+// ======================================================
+// Constant PWM trial helpers
+// ======================================================
+
+const char* trialStateName() {
+  if (trialState == TRIAL_IDLE) {
+    return "Idle";
+  }
+
+  if (trialState == TRIAL_WAITING) {
+    return "TrialWait";
+  }
+
+  if (trialState == TRIAL_MOVING_UP) {
+    return "TrialUp";
+  }
+
+  if (trialState == TRIAL_PAUSE_TOP) {
+    return "TrialTopPause";
+  }
+
+  if (trialState == TRIAL_MOVING_DOWN) {
+    return "TrialDown";
+  }
+
+  if (trialState == TRIAL_DONE) {
+    return "TrialDone";
+  }
+
+  return "Unknown";
+}
+
+bool trialIsRunning() {
+  return trialState == TRIAL_WAITING ||
+         trialState == TRIAL_MOVING_UP ||
+         trialState == TRIAL_PAUSE_TOP ||
+         trialState == TRIAL_MOVING_DOWN;
+}
+
+void resetTrialOnly() {
+  trialState = TRIAL_IDLE;
+  trialStartMs = 0;
+  trialMotionStartMs = 0;
+  trialReached90Ms = 0;
+  trialReached0Ms = 0;
+  trialTopPauseStartMs = 0;
+  trialCountsAt90 = 0;
+  trialCountsAt0 = 0;
+}
+
+void driveTrialMotor(int dir, int pwm) {
+  int actualDir = dir * m2.motSign;
+
+  pwm = constrain(pwm, 0, 255);
+
+  m2.lastPwm = pwm;
+  m2.lastUNorm = (float)pwm / (float)m2.maxPwm;
+
+  if (m2.lastUNorm > 1.0) {
+    m2.lastUNorm = 1.0;
+  }
+
+  m2.lastU = actualDir * pwm;
+
+  drive(m2, actualDir, pwm);
+}
+
+void startConstantPwmTrial() {
+  // Stop any other mode first.
+  stopTraj();
+  manMode = false;
+  manDir = 0;
+  off(m1);
+  off(m2);
+  resetMotor(m1);
+  resetMotor(m2);
+
+  // Reset sensors and encoders so every trial starts fresh.
+  enc1.write(0);
+  enc2.write(0);
+  imuZero();
+  enc1.write(0);
+  enc2.write(0);
+
+  trialId++;
+  trialStartMs = millis();
+  trialMotionStartMs = trialStartMs + TRIAL_START_DELAY_MS;
+  trialReached90Ms = 0;
+  trialReached0Ms = 0;
+  trialTopPauseStartMs = 0;
+  trialCountsAt90 = 0;
+  trialCountsAt0 = 0;
+
+  m2.target = TRIAL_TOP_DEG;
+  m2.active = false;
+  m2.holding = false;
+  m2.printed = false;
+  m2.lastPwm = 0;
+  m2.lastUNorm = 0.0;
+  m2.lastU = 0.0;
+
+  trialState = TRIAL_WAITING;
+
+  lastPrintMs = 0;
+
+  Serial.print("EVENT,trial_start,");
+  Serial.print(trialId);
+  Serial.print(",");
+  Serial.print(trialStartMs);
+  Serial.print(",pwm,");
+  Serial.println(TRIAL_PWM);
+
+  Serial.println("New constant-PWM trial started. IMU and encoders reset.");
+}
+
+bool updateConstantPwmTrial() {
+  if (trialState == TRIAL_IDLE || trialState == TRIAL_DONE) {
+    return false;
+  }
+
+  if (!imuReady()) {
+    off(m2);
+    return true;
+  }
+
+  unsigned long now = millis();
+  float theta = axisVal();
+
+  if (now - trialStartMs > TRIAL_TIMEOUT_MS) {
+    off(m2);
+    trialState = TRIAL_DONE;
+
+    Serial.print("EVENT,timeout,");
+    Serial.print(trialId);
+    Serial.print(",");
+    Serial.print(now - trialStartMs);
+    Serial.print(",");
+    Serial.print(theta, 3);
+    Serial.print(",");
+    Serial.println(counts(m2));
+
+    return true;
+  }
+
+  if (trialState == TRIAL_WAITING) {
+    off(m2);
+    m2.target = TRIAL_TOP_DEG;
+    m2.lastPwm = 0;
+    m2.lastUNorm = 0.0;
+    m2.lastU = 0.0;
+
+    if (now >= trialMotionStartMs) {
+      trialState = TRIAL_MOVING_UP;
+
+      Serial.print("EVENT,moving_up,");
+      Serial.print(trialId);
+      Serial.print(",");
+      Serial.println(now - trialStartMs);
+    }
+
+    return true;
+  }
+
+  if (trialState == TRIAL_MOVING_UP) {
+    m2.target = TRIAL_TOP_DEG;
+    driveTrialMotor(TRIAL_UP_DIR, TRIAL_PWM);
+
+    if (theta >= TRIAL_TOP_DEG - TRIAL_TOL_DEG) {
+      off(m2);
+      m2.lastPwm = 0;
+      m2.lastUNorm = 0.0;
+      m2.lastU = 0.0;
+
+      trialReached90Ms = now - trialMotionStartMs;
+      trialCountsAt90 = counts(m2);
+      trialTopPauseStartMs = now;
+      trialState = TRIAL_PAUSE_TOP;
+
+      Serial.print("EVENT,reached_90,");
+      Serial.print(trialId);
+      Serial.print(",");
+      Serial.print(trialReached90Ms);
+      Serial.print(",");
+      Serial.print(theta, 3);
+      Serial.print(",");
+      Serial.println(trialCountsAt90);
+    }
+
+    return true;
+  }
+
+  if (trialState == TRIAL_PAUSE_TOP) {
+    off(m2);
+    m2.target = TRIAL_BOTTOM_DEG;
+    m2.lastPwm = 0;
+    m2.lastUNorm = 0.0;
+    m2.lastU = 0.0;
+
+    if (now - trialTopPauseStartMs >= TRIAL_TOP_PAUSE_MS) {
+      trialState = TRIAL_MOVING_DOWN;
+
+      Serial.print("EVENT,moving_down,");
+      Serial.print(trialId);
+      Serial.print(",");
+      Serial.println(now - trialStartMs);
+    }
+
+    return true;
+  }
+
+  if (trialState == TRIAL_MOVING_DOWN) {
+    m2.target = TRIAL_BOTTOM_DEG;
+    driveTrialMotor(TRIAL_DOWN_DIR, TRIAL_PWM);
+
+    if (theta <= TRIAL_BOTTOM_DEG + TRIAL_TOL_DEG) {
+      off(m2);
+      m2.lastPwm = 0;
+      m2.lastUNorm = 0.0;
+      m2.lastU = 0.0;
+
+      trialReached0Ms = now - trialMotionStartMs;
+      trialCountsAt0 = counts(m2);
+
+      unsigned long downTimeMs = 0;
+
+      if (trialReached0Ms >= trialReached90Ms) {
+        downTimeMs = trialReached0Ms - trialReached90Ms;
+      }
+
+      trialState = TRIAL_DONE;
+
+      Serial.print("EVENT,reached_0,");
+      Serial.print(trialId);
+      Serial.print(",");
+      Serial.print(trialReached0Ms);
+      Serial.print(",");
+      Serial.print(theta, 3);
+      Serial.print(",");
+      Serial.println(trialCountsAt0);
+
+      Serial.print("RESULT,");
+      Serial.print(trialId);
+      Serial.print(",time_to_90_s,");
+      Serial.print(trialReached90Ms / 1000.0, 4);
+      Serial.print(",time_90_to_0_s,");
+      Serial.print(downTimeMs / 1000.0, 4);
+      Serial.print(",total_motion_time_s,");
+      Serial.print(trialReached0Ms / 1000.0, 4);
+      Serial.print(",counts_at_90,");
+      Serial.print(trialCountsAt90);
+      Serial.print(",counts_at_0,");
+      Serial.println(trialCountsAt0);
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+void emergencyStop(const char* reason) {
+  stopTraj();
+  resetTrialOnly();
+  manMode = false;
+  manDir = 0;
+
+  off(m1);
+  off(m2);
+  resetMotor(m1);
+  resetMotor(m2);
+
+  Serial.print("EVENT,emergency_stop,");
+  Serial.print(trialId);
+  Serial.print(",");
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(axisVal(), 3);
+  Serial.print(",");
+  Serial.print(counts(m2));
+  Serial.print(",");
+  Serial.println(reason);
+
+  Serial.println("EMERGENCY STOP: motors off.");
+}
+
 // ======================================================
 // Serial commands
 // ======================================================
@@ -813,13 +1155,81 @@ void handleChar(char c) {
     return;
   }
 
+  // New constant-PWM trial: reset -> 0 -> 90 -> 0.
+  if (c == 'n' || c == 'N') {
+    startConstantPwmTrial();
+    return;
+  }
+
+  // Emergency stop.
+  if (c == 'e' || c == 'E' || c == ' ' || c == 's' || c == 'S' || c == 'p' || c == 'P') {
+    emergencyStop("user_command");
+    return;
+  }
+
+  // Manual reverse/down using a key.
+  if (c == 'a' || c == 'A') {
+    stopTraj();
+    resetTrialOnly();
+
+    manMode = true;
+    manDir = REV;
+
+    m2.active = false;
+    m2.holding = false;
+    m2.printed = false;
+
+    Serial.println("Manual mode: Motor 2 reverse/down");
+    return;
+  }
+
+  // Manual forward/up using d key.
+  if (c == 'd' || c == 'D') {
+    stopTraj();
+    resetTrialOnly();
+
+    manMode = true;
+    manDir = FWD;
+
+    m2.active = false;
+    m2.holding = false;
+    m2.printed = false;
+
+    Serial.println("Manual mode: Motor 2 forward/up");
+    return;
+  }
+
+  // Tune constant trial PWM from the keyboard.
+  if (c == '+') {
+    TRIAL_PWM += 5;
+    TRIAL_PWM = constrain(TRIAL_PWM, 0, 255);
+
+    Serial.print("TRIAL_PWM = ");
+    Serial.println(TRIAL_PWM);
+    return;
+  }
+
+  if (c == '-') {
+    TRIAL_PWM -= 5;
+    TRIAL_PWM = constrain(TRIAL_PWM, 0, 255);
+
+    Serial.print("TRIAL_PWM = ");
+    Serial.println(TRIAL_PWM);
+    return;
+  }
+
+  // Keep the working PID target controls from the reference code.
   if (isdigit(c)) {
+    resetTrialOnly();
     int digit = c - '0';
     setTarget(KEY_TGTS[digit]);
     return;
   }
 
+  // Keep the original sinusoidal trajectory control.
   if (c == 'x' || c == 'X') {
+    resetTrialOnly();
+
     if (trajOn) {
       Serial.println("Sinusoidal trajectory stopped.");
       resetTargets();
@@ -830,20 +1240,18 @@ void handleChar(char c) {
     return;
   }
 
-  if (c == 's' || c == 'p') {
-    Serial.println("Stop command received.");
+  if (c == 'r' || c == 'R') {
+    Serial.println("Recalibrating IMUs and resetting encoders...");
     resetTargets();
-    return;
-  }
-
-  if (c == 'r') {
-    Serial.println("Recalibrating IMUs...");
-    resetTargets();
+    enc1.write(0);
+    enc2.write(0);
     imuZero();
+    enc1.write(0);
+    enc2.write(0);
     return;
   }
 
-  if (c == 'm') {
+  if (c == 'm' || c == 'M') {
     menu();
     return;
   }
@@ -853,26 +1261,10 @@ void handleChar(char c) {
 }
 
 void handleArrow(char c) {
-  stopTraj();
-
   if (c == 'D') {
-    manMode = true;
-    manDir = REV;
-
-    m2.active = false;
-    m2.holding = false;
-    m2.printed = false;
-
-    Serial.println("Manual mode: Motor 2 reverse");
+    handleChar('a');
   } else if (c == 'C') {
-    manMode = true;
-    manDir = FWD;
-
-    m2.active = false;
-    m2.holding = false;
-    m2.printed = false;
-
-    Serial.println("Manual mode: Motor 2 forward");
+    handleChar('d');
   }
 }
 
@@ -904,6 +1296,7 @@ void updateAll() {
 
   static bool wasMan = false;
 
+  // Manual mode has priority over everything.
   if (manMode) {
     off(m1);
 
@@ -911,8 +1304,6 @@ void updateAll() {
 
     m2.lastPwm = MAN_PWM;
     m2.lastUNorm = (float)MAN_PWM / (float)m2.maxPwm;
-
-    // Correct signed manual command.
     m2.lastU = manDir * m2.motSign * MAN_PWM;
 
     if (m2.lastUNorm > 1.0) {
@@ -926,20 +1317,17 @@ void updateAll() {
   }
 
   if (wasMan) {
-    float current = axisVal();
-
-    m2.lastErr = errDeg(m2.target, current);
-    m2.sumErr = 0.0;
-    m2.lastMeas = current;
-    m2.lastOut = 0.0;
-    m2.lastUNorm = 0.0;
+    off(m2);
     m2.lastPwm = 0;
+    m2.lastUNorm = 0.0;
     m2.lastU = 0.0;
-    m2.holding = false;
-    m2.printed = false;
-    m2.startMs = millis();
-
     wasMan = false;
+  }
+
+  // Constant PWM trial mode runs without PID.
+  if (updateConstantPwmTrial()) {
+    printData();
+    return;
   }
 
   updateTraj();
@@ -967,16 +1355,57 @@ void printQuat(const char* label, Quat q) {
 }
 
 void printData() {
-  if (millis() - lastPrintMs < PRINT_MS) {
+  unsigned long now = millis();
+
+  if (now - lastPrintMs < PRINT_MS) {
     return;
   }
 
-  lastPrintMs = millis();
+  lastPrintMs = now;
+  unsigned long dataTimeMs = now;
+
+  if (trialState != TRIAL_IDLE && trialStartMs > 0) {
+    dataTimeMs = now - trialStartMs;
+  }
+
+  String modeText;
+
+  if (manMode) {
+    modeText = "Manual";
+  } else if (trialState != TRIAL_IDLE) {
+    modeText = trialStateName();
+  } else if (trajOn) {
+    modeText = "Traj";
+  } else if (m2.active) {
+    modeText = "PID";
+  } else {
+    modeText = "Idle";
+  }
+
+  // Fast compact line for Python CSV logging.
+  // First five values match: DATA,time_ms,theta_deg,m1_counts,m2_counts
+  Serial.print("DATA,");
+  Serial.print(dataTimeMs);
+  Serial.print(",");
+  Serial.print(axisVal(), 4);
+  Serial.print(",");
+  Serial.print(counts(m1));
+  Serial.print(",");
+  Serial.print(counts(m2));
+  Serial.print(",");
+  Serial.print(m2.lastPwm);
+  Serial.print(",");
+  Serial.print(m2.lastU, 3);
+  Serial.print(",");
+  Serial.print(modeText);
+  Serial.print(",");
+  Serial.println(trialId);
 
   float targetDeg = manMode ? axisVal() : m2.target;
   float currentDeg = axisVal();
   float errorDeg = manMode ? 0.0 : errDeg(targetDeg, currentDeg);
 
+  // Keep the original visualizer-readable debug line format.
   Serial.print("\nTargetDeg: ");
   Serial.print(targetDeg, 2);
 
@@ -1002,16 +1431,7 @@ void printData() {
   Serial.print(m2.lastU, 3);
 
   Serial.print(" | Mode: ");
-
-  if (manMode) {
-    Serial.print("Manual");
-  } else if (trajOn) {
-    Serial.print("Traj");
-  } else if (m2.active) {
-    Serial.print("PID");
-  } else {
-    Serial.print("Idle");
-  }
+  Serial.print(modeText);
 
   Serial.print(" | FreqHz: ");
   Serial.print(TRAJ_FREQ, 3);
@@ -1034,23 +1454,24 @@ void printData() {
 void menu() {
   Serial.println();
   Serial.println("========== MENU ==========");
-  Serial.println("0-9  : Move Motor 2 to selected target");
-  Serial.println("0 = 5 deg");
-  Serial.println("1 = 10 deg");
-  Serial.println("2 = 20 deg");
-  Serial.println("3 = 30 deg");
-  Serial.println("4 = 40 deg");
-  Serial.println("5 = 50 deg");
-  Serial.println("6 = 60 deg");
-  Serial.println("7 = 70 deg");
-  Serial.println("8 = 80 deg");
-  Serial.println("9 = 90 deg");
-  Serial.println("x    : Start/stop sinusoidal trajectory");
-  Serial.println("Left : Manual Motor 2 reverse");
-  Serial.println("Right: Manual Motor 2 forward");
-  Serial.println("s/p  : Stop motor");
-  Serial.println("r    : Recalibrate / zero IMUs");
+  Serial.println("n    : Start constant PWM 0 -> 90 -> 0 trial");
+  Serial.println("+/-  : Increase/decrease TRIAL_PWM by 5");
+  Serial.println("a    : Manual Motor 2 reverse/down");
+  Serial.println("d    : Manual Motor 2 forward/up");
+  Serial.println("Left : Manual Motor 2 reverse/down");
+  Serial.println("Right: Manual Motor 2 forward/up");
+  Serial.println("s/p/e/space : Emergency stop");
+  Serial.println("r    : Recalibrate / zero IMUs and encoders");
   Serial.println("m    : Print menu");
+  Serial.println();
+  Serial.println("Reference controls still available:");
+  Serial.println("0-9  : Move Motor 2 to selected PID target");
+  Serial.println("x    : Start/stop sinusoidal trajectory");
+  Serial.println();
+  Serial.println("CSV data format:");
+  Serial.println("DATA,time_ms,theta_deg,m1_counts,m2_counts,pwm,u_cmd,mode,trial_id");
+  Serial.print("TRIAL_PWM = ");
+  Serial.println(TRIAL_PWM);
   Serial.println("==========================");
   Serial.println();
 }
@@ -1072,7 +1493,7 @@ void setup() {
 
   delay(1500);
 
-  Serial.println("Starting dual IMU elbow controller...");
+  Serial.println("Starting dual IMU elbow controller with constant PWM trial mode...");
 
   if (!imuStart()) {
     Serial.println("IMU startup failed. Check wiring.");
@@ -1081,7 +1502,7 @@ void setup() {
   resetTargets();
 
   lastCtrlUs = micros();
-  lastPrintMs = millis();
+  lastPrintMs = 0;
 
   menu();
 }

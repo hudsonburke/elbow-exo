@@ -438,7 +438,7 @@ def main():
         width_ratios=[ARM_PANEL_WIDTH, GRAPH_PANEL_WIDTH],
         height_ratios=[1.0, 1.0, 1.0, 1.0],
         wspace=0.35,
-        hspace=0.80
+        hspace=0.75
     )
 
     arm_axis = figure.add_subplot(grid[:, 0], projection="3d")
@@ -575,9 +575,9 @@ def main():
         label="u(t)"
     )
 
-    u_time_axis.set_title("Input u(t): Signed PWM Command vs Time", fontsize=10)
+    u_time_axis.set_title("u(t): Signed PWM Command vs Time", fontsize=10)
     u_time_axis.set_xlabel("Time t (s)", fontsize=8)
-    u_time_axis.set_ylabel("u(t) signed PWM", fontsize=8)
+    u_time_axis.set_ylabel("u(t)", fontsize=8)
     u_time_axis.grid(True, alpha=0.3)
     u_time_axis.set_xlim(0.0, 1.0)
     u_time_axis.set_ylim(-260, 260)
@@ -596,12 +596,12 @@ def main():
         label="θ(t) vs u(t)"
     )
 
-    angle_u_axis.set_title("Input-Output Plot: θ(t) vs u(t)", fontsize=10)
-    angle_u_axis.set_xlabel("Input u(t): signed PWM command", fontsize=8)
-    angle_u_axis.set_ylabel("Output θ(t): joint angle", fontsize=8)
+    angle_u_axis.set_title("G(t): θ(t)/u(t)", fontsize=10)
+    angle_u_axis.set_xlabel("u(t)", fontsize=8)
+    angle_u_axis.set_ylabel("θ(t)", fontsize=8)
     angle_u_axis.grid(True, alpha=0.3)
-    angle_u_axis.set_xlim(-260, 260)
-    angle_u_axis.set_ylim(-5, 95)
+    angle_u_axis.set_xlim(-300, 300)
+    angle_u_axis.set_ylim(-10, 120)
     angle_u_axis.legend(loc="upper right", fontsize=7)
 
     # Smaller bottom status text
