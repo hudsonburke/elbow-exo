@@ -37,7 +37,7 @@ ELBOW_TO_FOREARM_IMU = 7
 FOREARM_IMU_TO_HAND = 4
 
 # The IMU-reported joint angle is zero at a physical elbow angle of _ degrees.
-THETA0_DEG = 15.0
+THETA0_DEG = 30.0
 
 # Tracking axis: your testing showed the IMU/arm motion behaves correctly
 # when the arm segment is treated as the IMU's local +X axis.
@@ -361,6 +361,13 @@ def main():
     reader.start()
 
     fig = plt.figure(figsize=(19, 7))
+    fig.subplots_adjust(
+    left=0.04,
+    right=0.98,
+    bottom=0.18,
+    top=0.95,
+    wspace=0.5
+)
     ax = fig.add_subplot(1, 3, 1, projection="3d")
     angle_ax = fig.add_subplot(1, 3, 2)
     distance_ax = fig.add_subplot(1, 3, 3)
@@ -545,7 +552,7 @@ def main():
             )
 
         status = [
-            "0-9 target | left/right | p pause | r recalibrate | c clear | g reset graph | q quit",
+            "0-9 | left/right | p pause | r reset | c clear | g reset graph | q quit",
             f"Target: {latest['target_deg']:.2f} deg | Joint: {joint_display_deg:.2f} deg | Error: {latest['error_deg']:.2f} deg",
             f"theta0: {THETA0_DEG:.2f} deg",
             f"Measured IMU distance: {measured_imu_distance:.4f} | Taylor estimate: {taylor_distance:.4f}",
