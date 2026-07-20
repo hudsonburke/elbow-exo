@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
 # Keyboard controls inside the plot window:
+#   n          send selected PWM, move to final angle, then save CSV
+#   up/+       increase selected trial PWM by 5
+#   down/-     decrease selected trial PWM by 5
+#   l          start/stop manual CSV logging
 #   0-9        send selected target angle
 #   x          start/stop sinusoidal trajectory in C++ code
 #   left       manual motor reverse
@@ -12,10 +16,13 @@
 #   g          reset the graphs
 #   q          quit visualizer
 
+import csv
 import re
 import threading
 import time
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
@@ -28,7 +35,11 @@ import serial
 # =====================================================
 
 SERIAL_PORT = "COM8"
-BAUD_RATE = 115200
+BAUD_RATE = 230400
+
+# Edit this value to choose the PWM used by the next N trial.
+DEFAULT_TRIAL_PWM = 150
+PWM_STEP = 5
 
 # Smaller overall window
 WINDOW_SIZE = (15, 11.5)
@@ -37,7 +48,7 @@ WINDOW_SIZE = (15, 11.5)
 ARM_PANEL_WIDTH = 0.95
 GRAPH_PANEL_WIDTH = 1.0
 
-HISTORY_POINTS = 300
+HISTORY_POINTS = 1000
 ANIMATION_INTERVAL_MS = 35
 
 SHOULDER_TO_UPPER_IMU = 1.0
@@ -51,6 +62,22 @@ UPPER_ARM_DIRECTION_SIGN = -1.0
 FOREARM_DIRECTION_SIGN = -1.0
 
 PRINT_RAW_SERIAL = False
+
+# CSV files are stored in this folder beside the Python program.
+DATA_DIRECTORY = Path(__file__).resolve().parent / "system_id_data"
+
+# Columns intentionally match the MATLAB system-identification script.
+CSV_FIELDNAMES = [
+    "computer_time",
+    "time_s",
+    "theta_deg",
+    "m1_counts",
+    "m2_counts",
+    "pwm",
+    "u_cmd",
+    "mode",
+    "trial_id",
+]
 
 
 # =====================================================
@@ -172,6 +199,15 @@ serial_line_queue = deque()
 stop_requested = threading.Event()
 serial_connection = None
 
+# CSV logging state
+log_rows = []
+logging_active = False
+logging_label = ""
+current_trial_id = 0
+manual_log_number = 0
+last_saved_csv = None
+
+
 telemetry = {
     "upper_quaternion": np.array([1.0, 0.0, 0.0, 0.0]),
     "forearm_quaternion": np.array([1.0, 0.0, 0.0, 0.0]),
@@ -188,6 +224,8 @@ telemetry = {
     "mode": "unknown",
     "motor_1_counts": 0,
     "motor_2_counts": 0,
+    "board_time_s": 0.0,
+    "trial_id": 0,
 
     "lines_read": 0,
     "quaternion_lines_read": 0,
@@ -254,11 +292,198 @@ def read_serial_lines(connection):
 
 
 # =====================================================
+# CSV logging
+# =====================================================
+
+def safe_filename_piece(text):
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(text)).strip("_")
+    return cleaned or "recording"
+
+
+def start_csv_logging(label, trial_id=0):
+    global logging_active
+    global logging_label
+    global current_trial_id
+    global log_rows
+
+    if logging_active and log_rows:
+        save_csv_logging("new_recording_started")
+
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+    logging_active = True
+    logging_label = safe_filename_piece(label)
+    current_trial_id = int(trial_id)
+    log_rows = []
+
+    print(
+        f"CSV logging started: {logging_label} "
+        f"(trial_id={current_trial_id})"
+    )
+
+
+def save_csv_logging(reason="completed"):
+    global logging_active
+    global logging_label
+    global current_trial_id
+    global log_rows
+    global last_saved_csv
+
+    if not logging_active:
+        return None
+
+    if not log_rows:
+        print("CSV logging stopped, but no DATA samples were received.")
+        logging_active = False
+        logging_label = ""
+        current_trial_id = 0
+        return None
+
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    reason_piece = safe_filename_piece(reason)
+    label_piece = safe_filename_piece(logging_label)
+
+    filename = f"{label_piece}_{timestamp}_{reason_piece}.csv"
+    output_path = DATA_DIRECTORY / filename
+
+    try:
+        with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(log_rows)
+
+        last_saved_csv = output_path
+        print(f"Saved {len(log_rows)} samples to:")
+        print(output_path)
+
+    except OSError as error:
+        print(f"Failed to save CSV: {error}")
+        return None
+
+    finally:
+        logging_active = False
+        logging_label = ""
+        current_trial_id = 0
+        log_rows = []
+
+    return output_path
+
+
+def parse_data_line(line):
+    """Parse the compact C++ line:
+    DATA,time_ms,theta_deg,m1_counts,m2_counts,pwm,u_cmd,mode,trial_id
+    """
+    global log_rows
+
+    parts = [part.strip() for part in line.split(",")]
+
+    if len(parts) != 9 or parts[0] != "DATA":
+        return False
+
+    try:
+        time_s = float(parts[1]) / 1000.0
+        theta_deg = float(parts[2])
+        m1_counts = int(parts[3])
+        m2_counts = int(parts[4])
+        pwm = int(parts[5])
+        u_cmd = float(parts[6])
+        mode = parts[7]
+        trial_id = int(parts[8])
+
+    except ValueError:
+        return False
+
+    # Update live telemetry directly from the compact DATA record.
+    telemetry["board_time_s"] = time_s
+    telemetry["current_angle"] = theta_deg
+    telemetry["motor_1_counts"] = m1_counts
+    telemetry["motor_2_counts"] = m2_counts
+    telemetry["pwm"] = pwm
+    telemetry["u_cmd"] = u_cmd
+    telemetry["pwm_norm"] = min(abs(pwm) / 255.0, 1.0)
+    telemetry["mode"] = mode
+    telemetry["trial_id"] = trial_id
+
+    # Fallback: start logging if the EVENT line was missed but trial DATA arrives.
+    if (
+        not logging_active
+        and trial_id > 0
+        and mode in {
+            "TrialWait",
+            "TrialUp",
+        }
+    ):
+        start_csv_logging(f"system_id_trial_{trial_id:03d}", trial_id)
+
+    if logging_active:
+        # For automatic trial logging, reject unrelated trial IDs.
+        if current_trial_id > 0 and trial_id != current_trial_id:
+            return True
+
+        log_rows.append({
+            "computer_time": datetime.now().isoformat(timespec="milliseconds"),
+            "time_s": f"{time_s:.6f}",
+            "theta_deg": f"{theta_deg:.6f}",
+            "m1_counts": m1_counts,
+            "m2_counts": m2_counts,
+            "pwm": pwm,
+            "u_cmd": f"{u_cmd:.6f}",
+            "mode": mode,
+            "trial_id": trial_id,
+        })
+
+    return True
+
+
+def parse_event_line(line):
+    """Use C++ EVENT lines to automatically begin and end trial logging."""
+    parts = [part.strip() for part in line.split(",")]
+
+    if len(parts) < 2 or parts[0] != "EVENT":
+        return False
+
+    event_name = parts[1]
+
+    if event_name == "trial_start" and len(parts) >= 3:
+        try:
+            trial_id = int(parts[2])
+        except ValueError:
+            trial_id = 0
+
+        start_csv_logging(f"system_id_trial_{trial_id:03d}", trial_id)
+        return True
+
+    if event_name in {"reached_final", "reached_90"}:
+        save_csv_logging("completed_at_final_angle")
+        return True
+
+    if event_name == "timeout":
+        save_csv_logging("timeout")
+        return True
+
+    if event_name == "emergency_stop":
+        save_csv_logging("emergency_stop")
+        return True
+
+    return True
+
+
+# =====================================================
 # Serial parsing
 # =====================================================
 
 def parse_serial_line(line):
     telemetry["lines_read"] += 1
+
+    if line.startswith("DATA,"):
+        parse_data_line(line)
+        return
+
+    if line.startswith("EVENT,"):
+        parse_event_line(line)
+        return
 
     quaternion_match = QUATERNION_LINE_PATTERN.search(line)
 
@@ -404,6 +629,8 @@ def reset_telemetry():
         "mode": "cleared",
         "motor_1_counts": 0,
         "motor_2_counts": 0,
+        "board_time_s": 0.0,
+        "trial_id": 0,
 
         "lines_read": 0,
         "quaternion_lines_read": 0,
@@ -462,6 +689,7 @@ def main():
     angle_for_u_history = deque(maxlen=HISTORY_POINTS)
 
     start_time = time.monotonic()
+    selected_trial_pwm = max(0, min(255, int(DEFAULT_TRIAL_PWM)))
 
     total_arm_length = (
         SHOULDER_TO_UPPER_IMU
@@ -642,6 +870,9 @@ def main():
         angle_u_axis.set_ylim(-5, 95)
 
     def handle_key_press(event):
+        global manual_log_number
+        nonlocal selected_trial_pwm
+
         if event.key is None:
             return
 
@@ -649,7 +880,46 @@ def main():
 
         print(f"Key pressed: {key}")
 
-        if key in [str(i) for i in range(10)]:
+        if key == "n":
+            reset_plot_history()
+
+            # Send the exact selected PWM first. The C++ command format is:
+            # v<PWM><Enter>, for example v150.
+            send_serial_command(f"v{selected_trial_pwm}")
+            send_serial_command("n")
+
+            print(
+                "One-way constant-PWM system-identification trial requested "
+                f"at PWM {selected_trial_pwm}."
+            )
+
+        elif key in ["up", "+", "="]:
+            selected_trial_pwm = min(
+                255,
+                selected_trial_pwm + PWM_STEP,
+            )
+            send_serial_command(f"v{selected_trial_pwm}")
+            print(f"Selected trial PWM: {selected_trial_pwm}")
+
+        elif key in ["down", "-"]:
+            selected_trial_pwm = max(
+                0,
+                selected_trial_pwm - PWM_STEP,
+            )
+            send_serial_command(f"v{selected_trial_pwm}")
+            print(f"Selected trial PWM: {selected_trial_pwm}")
+
+        elif key == "l":
+            if logging_active:
+                save_csv_logging("manual_stop")
+            else:
+                manual_log_number += 1
+                start_csv_logging(
+                    f"manual_system_id_{manual_log_number:03d}",
+                    trial_id=0,
+                )
+
+        elif key in [str(i) for i in range(10)]:
             send_serial_command(key)
 
         elif key == "left":
@@ -681,6 +951,9 @@ def main():
             print("Reset graphs.")
 
         elif key == "q":
+            if logging_active:
+                save_csv_logging("quit")
+
             stop_requested.set()
             plt.close(figure)
 
@@ -802,9 +1075,17 @@ def main():
 
         status_lines = [
             (
-                "Keys: 0-9 target | x trajectory | left/right manual | "
-                "p/space pause | r recalibrate | m menu | "
-                "c clear | g reset graphs | q quit"
+                "Keys: n one-way system-ID trial | up/+ PWM+5 | down/- PWM-5 | "
+                "l manual log | 0-9 target | x trajectory | "
+                "left/right manual | p/space pause | "
+                "r recalibrate | m menu | c clear | g reset | q quit"
+            ),
+            (
+                f"Selected trial PWM: {selected_trial_pwm} | "
+                f"CSV: {'RECORDING' if logging_active else 'idle'} | "
+                f"Samples: {len(log_rows)} | "
+                f"Trial ID: {telemetry['trial_id']} | "
+                f"Board time: {telemetry['board_time_s']:.3f} s"
             ),
             (
                 f"Target: {telemetry['target_angle']:.2f} deg | "
@@ -849,6 +1130,9 @@ def main():
         plt.show()
 
     finally:
+        if logging_active:
+            save_csv_logging("window_closed")
+
         stop_requested.set()
 
 
