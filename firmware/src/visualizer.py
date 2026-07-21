@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Old visualizer layout adapted for the final dual-motor controller.
 
-The original visualizer layout is kept:
-    - A 3D arm view on the left
+The visualizer keeps the main final-product displays:
+    - A smaller 3D arm view on the left
     - Joint angles versus time
-    - Normalized control effort versus time
+    - Angular velocity versus time
     - Signed PWM command versus time
-    - Joint angle versus signed PWM command
+
+The velocity graph uses the exact desired and measured velocity values sent by
+an updated controller. If those VELOCITY messages are unavailable, the program
+uses a numerical derivative as a clearly labeled fallback.
 
 Motor colors:
     - Motor 1 is blue
@@ -51,12 +54,12 @@ SERIAL_PORT = "COM8"
 BAUD_RATE = 230400
 SERIAL_TIMEOUT_SECONDS = 0.1
 
-# Original visualizer window and panel sizes.
-WINDOW_SIZE = (15, 11.5)
-ARM_PANEL_WIDTH = 0.95
-GRAPH_PANEL_WIDTH = 1.0
+# Reduced layout: the 3D arm is slightly smaller and the graphs get more width.
+WINDOW_SIZE = (15, 10.5)
+ARM_PANEL_WIDTH = 0.72
+GRAPH_PANEL_WIDTH = 1.28
 
-HISTORY_POINTS = 1000
+HISTORY_POINTS = 1200
 ANIMATION_INTERVAL_MS = 35
 
 # Approximate segment lengths used only by the 3D picture.
@@ -74,6 +77,13 @@ PRINT_RAW_SERIAL = False
 # Motor 2 keeps a separate color so it is easy to distinguish.
 MOTOR_1_COLOR = "tab:blue"
 MOTOR_2_COLOR = "tab:orange"
+
+# Used only when an older controller does not send VELOCITY telemetry.
+MEASURED_VELOCITY_FILTER_ALPHA = 0.25
+TARGET_VELOCITY_FILTER_ALPHA = 0.50
+MIN_VALID_DT_SECONDS = 0.001
+MAX_VALID_DT_SECONDS = 0.250
+VELOCITY_TIMESTAMP_TOLERANCE_SECONDS = 0.005
 
 
 # =====================================================
@@ -182,6 +192,8 @@ def make_default_telemetry() -> dict[str, object]:
         "m1_pwm": 0,
         "m1_u_cmd": 0.0,
         "m1_counts": 0,
+        "m1_velocity": 0.0,
+        "m1_target_velocity": 0.0,
         "m2_mode": "Idle",
         "m2_target": 0.0,
         "m2_current": 0.0,
@@ -189,6 +201,9 @@ def make_default_telemetry() -> dict[str, object]:
         "m2_pwm": 0,
         "m2_u_cmd": 0.0,
         "m2_counts": 0,
+        "m2_velocity": 0.0,
+        "m2_target_velocity": 0.0,
+        "velocity_source": "Waiting for telemetry",
         "upper_angle": 0.0,
         "elbow_angle": 0.0,
         "rejected_spikes": 0,
@@ -198,6 +213,14 @@ def make_default_telemetry() -> dict[str, object]:
 
 
 telemetry = make_default_telemetry()
+
+# Previous samples are kept only for the older-controller fallback.
+_previous_time_s: float | None = None
+_previous_m1_angle: float = 0.0
+_previous_m1_target: float = 0.0
+_previous_m2_angle: float = 0.0
+_previous_m2_target: float = 0.0
+_last_controller_velocity_time_s: float | None = None
 
 
 def reset_telemetry() -> None:
@@ -260,45 +283,159 @@ def read_serial_lines(connection: serial.Serial) -> None:
             pass
 
 
+def low_pass(previous: float, new_value: float, alpha: float) -> float:
+    """Apply a simple low-pass filter to a fallback velocity estimate."""
+    return alpha * new_value + (1.0 - alpha) * previous
+
+
+def parse_velocity_line(line: str) -> bool:
+    """Read exact velocity values used inside the controller.
+
+    Expected format:
+        VELOCITY,time_ms,
+        m1_desired_velocity,m1_measured_velocity,
+        m2_desired_velocity,m2_measured_velocity
+    """
+    global _last_controller_velocity_time_s
+
+    parts = [part.strip() for part in line.split(",")]
+
+    if len(parts) != 6 or parts[0] != "VELOCITY":
+        return False
+
+    try:
+        time_s = float(parts[1]) / 1000.0
+        telemetry["m1_target_velocity"] = float(parts[2])
+        telemetry["m1_velocity"] = float(parts[3])
+        telemetry["m2_target_velocity"] = float(parts[4])
+        telemetry["m2_velocity"] = float(parts[5])
+    except ValueError:
+        return False
+
+    telemetry["velocity_source"] = "Controller internal values"
+    _last_controller_velocity_time_s = time_s
+    return True
+
+
 def parse_state_line(line: str) -> bool:
-    """Read the compact STATE line sent by the dual-motor controller."""
+    """Read the compact STATE line sent by the dual-motor controller.
+
+    The updated controller sends a matching VELOCITY line immediately before
+    this line. When that message is missing, velocity is estimated from the
+    change in angle divided by the change in time.
+    """
+    global _previous_time_s
+    global _previous_m1_angle
+    global _previous_m1_target
+    global _previous_m2_angle
+    global _previous_m2_target
+
     parts = [part.strip() for part in line.split(",")]
 
     if len(parts) != 20 or parts[0] != "STATE":
         return False
 
     try:
-        telemetry["board_time_s"] = float(parts[1]) / 1000.0
-        telemetry["selected_motor"] = parts[2]
+        time_s = float(parts[1]) / 1000.0
+        selected_motor = parts[2]
 
-        telemetry["m1_mode"] = parts[3]
-        telemetry["m1_target"] = float(parts[4])
-        telemetry["m1_current"] = float(parts[5])
-        telemetry["m1_error"] = float(parts[6])
-        telemetry["m1_pwm"] = int(parts[7])
-        telemetry["m1_u_cmd"] = float(parts[8])
-        telemetry["m1_counts"] = int(parts[9])
+        m1_mode = parts[3]
+        m1_target = float(parts[4])
+        m1_current = float(parts[5])
+        m1_error = float(parts[6])
+        m1_pwm = int(parts[7])
+        m1_u_cmd = float(parts[8])
+        m1_counts = int(parts[9])
 
-        telemetry["m2_mode"] = parts[10]
-        telemetry["m2_target"] = float(parts[11])
-        telemetry["m2_current"] = float(parts[12])
-        telemetry["m2_error"] = float(parts[13])
-        telemetry["m2_pwm"] = int(parts[14])
-        telemetry["m2_u_cmd"] = float(parts[15])
-        telemetry["m2_counts"] = int(parts[16])
+        m2_mode = parts[10]
+        m2_target = float(parts[11])
+        m2_current = float(parts[12])
+        m2_error = float(parts[13])
+        m2_pwm = int(parts[14])
+        m2_u_cmd = float(parts[15])
+        m2_counts = int(parts[16])
 
-        telemetry["upper_angle"] = float(parts[17])
-        telemetry["elbow_angle"] = float(parts[18])
-        telemetry["rejected_spikes"] = int(parts[19])
-
+        upper_angle = float(parts[17])
+        elbow_angle = float(parts[18])
+        rejected_spikes = int(parts[19])
     except ValueError:
         return False
+
+    controller_velocity_is_current = (
+        _last_controller_velocity_time_s is not None
+        and abs(_last_controller_velocity_time_s - time_s)
+        <= VELOCITY_TIMESTAMP_TOLERANCE_SECONDS
+    )
+
+    if not controller_velocity_is_current and _previous_time_s is not None:
+        dt = time_s - _previous_time_s
+
+        if MIN_VALID_DT_SECONDS <= dt <= MAX_VALID_DT_SECONDS:
+            raw_m1_velocity = (m1_current - _previous_m1_angle) / dt
+            raw_m1_target_velocity = (m1_target - _previous_m1_target) / dt
+            raw_m2_velocity = (m2_current - _previous_m2_angle) / dt
+            raw_m2_target_velocity = (m2_target - _previous_m2_target) / dt
+
+            telemetry["m1_velocity"] = low_pass(
+                float(telemetry["m1_velocity"]),
+                raw_m1_velocity,
+                MEASURED_VELOCITY_FILTER_ALPHA,
+            )
+            telemetry["m1_target_velocity"] = low_pass(
+                float(telemetry["m1_target_velocity"]),
+                raw_m1_target_velocity,
+                TARGET_VELOCITY_FILTER_ALPHA,
+            )
+            telemetry["m2_velocity"] = low_pass(
+                float(telemetry["m2_velocity"]),
+                raw_m2_velocity,
+                MEASURED_VELOCITY_FILTER_ALPHA,
+            )
+            telemetry["m2_target_velocity"] = low_pass(
+                float(telemetry["m2_target_velocity"]),
+                raw_m2_target_velocity,
+                TARGET_VELOCITY_FILTER_ALPHA,
+            )
+            telemetry["velocity_source"] = "Python numerical fallback"
+
+    telemetry["board_time_s"] = time_s
+    telemetry["selected_motor"] = selected_motor
+
+    telemetry["m1_mode"] = m1_mode
+    telemetry["m1_target"] = m1_target
+    telemetry["m1_current"] = m1_current
+    telemetry["m1_error"] = m1_error
+    telemetry["m1_pwm"] = m1_pwm
+    telemetry["m1_u_cmd"] = m1_u_cmd
+    telemetry["m1_counts"] = m1_counts
+
+    telemetry["m2_mode"] = m2_mode
+    telemetry["m2_target"] = m2_target
+    telemetry["m2_current"] = m2_current
+    telemetry["m2_error"] = m2_error
+    telemetry["m2_pwm"] = m2_pwm
+    telemetry["m2_u_cmd"] = m2_u_cmd
+    telemetry["m2_counts"] = m2_counts
+
+    telemetry["upper_angle"] = upper_angle
+    telemetry["elbow_angle"] = elbow_angle
+    telemetry["rejected_spikes"] = rejected_spikes
+
+    _previous_time_s = time_s
+    _previous_m1_angle = m1_current
+    _previous_m1_target = m1_target
+    _previous_m2_angle = m2_current
+    _previous_m2_target = m2_target
 
     return True
 
 
 def parse_serial_line(line: str) -> None:
     telemetry["lines_read"] = int(telemetry["lines_read"]) + 1
+
+    if line.startswith("VELOCITY,"):
+        parse_velocity_line(line)
+        return
 
     if line.startswith("STATE,"):
         parse_state_line(line)
@@ -410,29 +547,28 @@ def main() -> None:
     )
     serial_thread.start()
 
-    # Keep the original window layout: 3D arm on the left and four graphs.
+    # Three time plots remain. The narrower left column makes the 3D arm smaller.
     figure = plt.figure(figsize=WINDOW_SIZE)
 
     grid = figure.add_gridspec(
-        4,
+        3,
         2,
         width_ratios=[ARM_PANEL_WIDTH, GRAPH_PANEL_WIDTH],
-        height_ratios=[1.0, 1.0, 1.0, 1.0],
-        wspace=0.35,
-        hspace=0.80,
+        height_ratios=[1.0, 1.0, 1.0],
+        wspace=0.32,
+        hspace=0.62,
     )
 
     arm_axis = figure.add_subplot(grid[:, 0], projection="3d")
     angle_axis = figure.add_subplot(grid[0, 1])
-    pwm_norm_axis = figure.add_subplot(grid[1, 1])
+    velocity_axis = figure.add_subplot(grid[1, 1])
     u_time_axis = figure.add_subplot(grid[2, 1])
-    angle_u_axis = figure.add_subplot(grid[3, 1])
 
     figure.subplots_adjust(
         left=0.04,
         right=0.97,
         top=0.96,
-        bottom=0.10,
+        bottom=0.11,
     )
 
     # Separate history is kept for both motors.
@@ -443,14 +579,13 @@ def main() -> None:
     m2_angle_history: deque[float] = deque(maxlen=HISTORY_POINTS)
     m2_target_history: deque[float] = deque(maxlen=HISTORY_POINTS)
 
-    m1_pwm_norm_history: deque[float] = deque(maxlen=HISTORY_POINTS)
-    m2_pwm_norm_history: deque[float] = deque(maxlen=HISTORY_POINTS)
+    m1_velocity_history: deque[float] = deque(maxlen=HISTORY_POINTS)
+    m1_target_velocity_history: deque[float] = deque(maxlen=HISTORY_POINTS)
+    m2_velocity_history: deque[float] = deque(maxlen=HISTORY_POINTS)
+    m2_target_velocity_history: deque[float] = deque(maxlen=HISTORY_POINTS)
 
     m1_u_history: deque[float] = deque(maxlen=HISTORY_POINTS)
     m2_u_history: deque[float] = deque(maxlen=HISTORY_POINTS)
-
-    m1_angle_for_u_history: deque[float] = deque(maxlen=HISTORY_POINTS)
-    m2_angle_for_u_history: deque[float] = deque(maxlen=HISTORY_POINTS)
 
     start_time = time.monotonic()
 
@@ -588,35 +723,53 @@ def main() -> None:
     angle_axis.set_ylim(-5, 95)
     angle_axis.legend(loc="upper right", fontsize=7, ncol=2)
 
+
     # ---------------------
-    # Graph 2: normalized PWM versus time
+    # Graph 2: angular velocity versus time
     # ---------------------
 
-    m1_pwm_norm_line, = pwm_norm_axis.plot(
+    m1_velocity_line, = velocity_axis.plot(
         [],
         [],
         linewidth=2,
         color=MOTOR_1_COLOR,
-        label="M1 |PWM| / 255",
+        label="M1 measured velocity",
     )
-    m2_pwm_norm_line, = pwm_norm_axis.plot(
+    m1_target_velocity_line, = velocity_axis.plot(
+        [],
+        [],
+        linewidth=1.5,
+        linestyle="--",
+        color=MOTOR_1_COLOR,
+        label="M1 desired velocity",
+    )
+    m2_velocity_line, = velocity_axis.plot(
         [],
         [],
         linewidth=2,
         color=MOTOR_2_COLOR,
-        label="M2 |PWM| / 255",
+        label="M2 measured velocity",
+    )
+    m2_target_velocity_line, = velocity_axis.plot(
+        [],
+        [],
+        linewidth=1.5,
+        linestyle="--",
+        color=MOTOR_2_COLOR,
+        label="M2 desired velocity",
     )
 
-    pwm_norm_axis.set_title(
-        "Normalized Control Effort |u(t)|",
+    velocity_axis.axhline(0.0, linewidth=1, alpha=0.5)
+    velocity_axis.set_title(
+        "Angular Velocity: Measured vs Desired",
         fontsize=10,
     )
-    pwm_norm_axis.set_xlabel("Time t (s)", fontsize=8)
-    pwm_norm_axis.set_ylabel("Normalized PWM", fontsize=8)
-    pwm_norm_axis.grid(True, alpha=0.3)
-    pwm_norm_axis.set_xlim(0.0, 1.0)
-    pwm_norm_axis.set_ylim(-0.05, 1.05)
-    pwm_norm_axis.legend(loc="upper right", fontsize=7)
+    velocity_axis.set_xlabel("Time t (s)", fontsize=8)
+    velocity_axis.set_ylabel("Velocity (degrees/s)", fontsize=8)
+    velocity_axis.grid(True, alpha=0.3)
+    velocity_axis.set_xlim(0.0, 1.0)
+    velocity_axis.set_ylim(-30.0, 30.0)
+    velocity_axis.legend(loc="upper right", fontsize=7, ncol=2)
 
     # ---------------------
     # Graph 3: signed PWM versus time
@@ -648,40 +801,6 @@ def main() -> None:
     u_time_axis.set_ylim(-260, 260)
     u_time_axis.legend(loc="upper right", fontsize=7)
 
-    # ---------------------
-    # Graph 4: angle versus signed PWM
-    # ---------------------
-
-    m1_angle_u_line, = angle_u_axis.plot(
-        [],
-        [],
-        linewidth=1.5,
-        marker=".",
-        markersize=3,
-        color=MOTOR_1_COLOR,
-        label="M1 θ(t) vs u(t)",
-    )
-    m2_angle_u_line, = angle_u_axis.plot(
-        [],
-        [],
-        linewidth=1.5,
-        marker=".",
-        markersize=3,
-        color=MOTOR_2_COLOR,
-        label="M2 θ(t) vs u(t)",
-    )
-
-    angle_u_axis.set_title(
-        "Input-Output Plot: θ(t) vs u(t)",
-        fontsize=10,
-    )
-    angle_u_axis.set_xlabel("Input u(t): signed PWM command", fontsize=8)
-    angle_u_axis.set_ylabel("Output θ(t): angle (degrees)", fontsize=8)
-    angle_u_axis.grid(True, alpha=0.3)
-    angle_u_axis.set_xlim(-260, 260)
-    angle_u_axis.set_ylim(-5, 95)
-    angle_u_axis.legend(loc="upper right", fontsize=7)
-
     # Original small status area at the bottom of the window.
     status_text = figure.text(
         0.02,
@@ -702,14 +821,13 @@ def main() -> None:
         m2_angle_history.clear()
         m2_target_history.clear()
 
-        m1_pwm_norm_history.clear()
-        m2_pwm_norm_history.clear()
+        m1_velocity_history.clear()
+        m1_target_velocity_history.clear()
+        m2_velocity_history.clear()
+        m2_target_velocity_history.clear()
 
         m1_u_history.clear()
         m2_u_history.clear()
-
-        m1_angle_for_u_history.clear()
-        m2_angle_for_u_history.clear()
 
         start_time = time.monotonic()
 
@@ -718,17 +836,18 @@ def main() -> None:
             m1_target_line,
             m2_angle_line,
             m2_target_line,
-            m1_pwm_norm_line,
-            m2_pwm_norm_line,
+            m1_velocity_line,
+            m1_target_velocity_line,
+            m2_velocity_line,
+            m2_target_velocity_line,
             m1_u_time_line,
             m2_u_time_line,
-            m1_angle_u_line,
-            m2_angle_u_line,
         ):
             line.set_data([], [])
 
         angle_axis.set_xlim(0.0, 1.0)
-        pwm_norm_axis.set_xlim(0.0, 1.0)
+        velocity_axis.set_xlim(0.0, 1.0)
+        velocity_axis.set_ylim(-30.0, 30.0)
         u_time_axis.set_xlim(0.0, 1.0)
 
     def handle_key_press(event) -> None:
@@ -826,12 +945,14 @@ def main() -> None:
         m1_current = float(telemetry["m1_current"])
         m1_target = float(telemetry["m1_target"])
         m1_u = float(telemetry["m1_u_cmd"])
-        m1_pwm_norm = min(abs(float(telemetry["m1_pwm"])) / 255.0, 1.0)
+        m1_velocity = float(telemetry["m1_velocity"])
+        m1_target_velocity = float(telemetry["m1_target_velocity"])
 
         m2_current = float(telemetry["m2_current"])
         m2_target = float(telemetry["m2_target"])
         m2_u = float(telemetry["m2_u_cmd"])
-        m2_pwm_norm = min(abs(float(telemetry["m2_pwm"])) / 255.0, 1.0)
+        m2_velocity = float(telemetry["m2_velocity"])
+        m2_target_velocity = float(telemetry["m2_target_velocity"])
 
         time_history.append(elapsed_time)
 
@@ -840,14 +961,13 @@ def main() -> None:
         m2_angle_history.append(m2_current)
         m2_target_history.append(m2_target)
 
-        m1_pwm_norm_history.append(m1_pwm_norm)
-        m2_pwm_norm_history.append(m2_pwm_norm)
+        m1_velocity_history.append(m1_velocity)
+        m1_target_velocity_history.append(m1_target_velocity)
+        m2_velocity_history.append(m2_velocity)
+        m2_target_velocity_history.append(m2_target_velocity)
 
         m1_u_history.append(m1_u)
         m2_u_history.append(m2_u)
-
-        m1_angle_for_u_history.append(m1_current)
-        m2_angle_for_u_history.append(m2_current)
 
         # Graph 1: current and target angles.
         m1_angle_line.set_data(time_history, m1_angle_history)
@@ -855,25 +975,46 @@ def main() -> None:
         m2_angle_line.set_data(time_history, m2_angle_history)
         m2_target_line.set_data(time_history, m2_target_history)
 
-        # Graph 2: normalized control effort.
-        m1_pwm_norm_line.set_data(time_history, m1_pwm_norm_history)
-        m2_pwm_norm_line.set_data(time_history, m2_pwm_norm_history)
+        # Graph 2: exact controller velocity tracking.
+        m1_velocity_line.set_data(time_history, m1_velocity_history)
+        m1_target_velocity_line.set_data(
+            time_history,
+            m1_target_velocity_history,
+        )
+        m2_velocity_line.set_data(time_history, m2_velocity_history)
+        m2_target_velocity_line.set_data(
+            time_history,
+            m2_target_velocity_history,
+        )
 
         # Graph 3: signed PWM command.
         m1_u_time_line.set_data(time_history, m1_u_history)
         m2_u_time_line.set_data(time_history, m2_u_history)
-
-        # Graph 4: input-output relationship.
-        m1_angle_u_line.set_data(m1_u_history, m1_angle_for_u_history)
-        m2_angle_u_line.set_data(m2_u_history, m2_angle_for_u_history)
 
         if time_history:
             left_time = time_history[0]
             right_time = max(left_time + 1.0, time_history[-1] + 0.5)
 
             angle_axis.set_xlim(left_time, right_time)
-            pwm_norm_axis.set_xlim(left_time, right_time)
+            velocity_axis.set_xlim(left_time, right_time)
             u_time_axis.set_xlim(left_time, right_time)
+
+        velocity_values = (
+            list(m1_velocity_history)
+            + list(m1_target_velocity_history)
+            + list(m2_velocity_history)
+            + list(m2_target_velocity_history)
+        )
+        if velocity_values:
+            velocity_low = min(velocity_values)
+            velocity_high = max(velocity_values)
+            velocity_span = max(velocity_high - velocity_low, 20.0)
+            velocity_center = 0.5 * (velocity_low + velocity_high)
+            velocity_margin = 0.12 * velocity_span
+            velocity_axis.set_ylim(
+                velocity_center - 0.5 * velocity_span - velocity_margin,
+                velocity_center + 0.5 * velocity_span + velocity_margin,
+            )
 
         status_lines = [
             (
@@ -886,17 +1027,22 @@ def main() -> None:
                 f"M1 {telemetry['m1_mode']}: target "
                 f"{float(telemetry['m1_target']):.1f}°, current "
                 f"{float(telemetry['m1_current']):.1f}°, error "
-                f"{float(telemetry['m1_error']):.1f}°, PWM "
+                f"{float(telemetry['m1_error']):.1f}°, velocity "
+                f"{float(telemetry['m1_velocity']):.2f}°/s, desired "
+                f"{float(telemetry['m1_target_velocity']):.2f}°/s, PWM "
                 f"{float(telemetry['m1_u_cmd']):.0f}, counts "
                 f"{telemetry['m1_counts']}"
             ),
-            (
+            
                 f"M2 {telemetry['m2_mode']}: target "
                 f"{float(telemetry['m2_target']):.1f}°, current "
                 f"{float(telemetry['m2_current']):.1f}°, error "
-                f"{float(telemetry['m2_error']):.1f}°, PWM "
+                f"{float(telemetry['m2_error']):.1f}°, velocity "
+                f"{float(telemetry['m2_velocity']):.2f}°/s, desired "
+                f"{float(telemetry['m2_target_velocity']):.2f}°/s, PWM "
                 f"{float(telemetry['m2_u_cmd']):.0f}, counts "
-                f"{telemetry['m2_counts']} | Rejected spikes: "
+                f"{telemetry['m2_counts']} | Velocity source: "
+                f"{telemetry['velocity_source']} | Rejected spikes: "
                 f"{telemetry['rejected_spikes']}"
             ),
         ]
@@ -911,12 +1057,12 @@ def main() -> None:
             m1_target_line,
             m2_angle_line,
             m2_target_line,
-            m1_pwm_norm_line,
-            m2_pwm_norm_line,
+            m1_velocity_line,
+            m1_target_velocity_line,
+            m2_velocity_line,
+            m2_target_velocity_line,
             m1_u_time_line,
             m2_u_time_line,
-            m1_angle_u_line,
-            m2_angle_u_line,
             status_text,
         )
 

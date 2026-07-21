@@ -6,9 +6,9 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
-
+// ======================================================
 // FINAL DUAL-MOTOR, DUAL-IMU CONTROLLER
-
+// ======================================================
 //
 // PURPOSE
 // -------
@@ -34,10 +34,12 @@
 // 1. Read the two IMUs.
 // 2. Calculate the upper-arm angle and the relative elbow angle.
 // 3. Compare each motor's target angle with its measured angle.
-// 4. Use PI/PID control to calculate the motor command.
-// 5. Convert the controller output into a PWM value and direction.
-// 6. Send the PWM command to the motor driver.
-// 7. Repeat this process at 100 Hz.
+// 4. During oscillation, calculate desired angular velocity from the
+//    derivative of the desired-angle function.
+// 5. Use position error and velocity error in the PI/PID controller.
+// 6. Convert the controller output into a PWM value and direction.
+// 7. Send the PWM command to the motor driver.
+// 8. Repeat this process at 100 Hz.
 //
 // MOTOR FEEDBACK
 // --------------
@@ -74,7 +76,7 @@
 // - Manual arrow control is open-loop and does not stop at an angle target.
 // - Always press a stop key before the mechanism reaches a physical limit.
 // - Keep an emergency power-disconnect method available during testing.
-
+// ======================================================
 
 // ----------------------
 // Serial communication and timing
@@ -233,7 +235,7 @@ struct MotorController {
   // PID gains
   // kp reacts to the current position error.
   // ki reacts to error that continues over time.
-  // kd reacts to how quickly the measurement changes.
+  // kd reacts to velocity error: desired velocity minus measured velocity.
   // uFull is the controller-output value treated as full effort.
   float kp;
   float ki;
@@ -260,6 +262,13 @@ struct MotorController {
   float previousMeasurement;
   float previousOutput;
 
+  // Velocity tracking values in degrees per second.
+  // During oscillation, desiredVelocityDegPerSec comes from the exact
+  // derivative of the oscillation function. measuredVelocityDegPerSec is
+  // calculated from the IMU angle and filtered to reduce noise.
+  float desiredVelocityDegPerSec;
+  float measuredVelocityDegPerSec;
+
   // Most recent motor command, also used for telemetry
   float normalizedEffort;
   int pwm;
@@ -279,33 +288,37 @@ struct MotorController {
 };
 
 // Motor 1 tuning and limits.
-// Current gains make this a PI controller because kd is zero.
+// kd is now used as the velocity-tracking gain. The starting value is small
+// and should be tuned carefully on the real mechanism.
 MotorController motor1 = {
   "M1",
   M1_IN1, M1_IN2, &encoder1,
   M1_ENCODER_SIGN, M1_MOTOR_DIRECTION_SIGN, MOTOR_1_FEEDBACK,
 
-  0.90, 0.05, 0.0, 20.0,
+  0.90, 0.05, 0.10, 20.0,
   150, 255, 150,
   1.0, 5.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0,
   0.0, 0, 0.0,
   false, false, false, false, 0, 0, 0
 };
 
 // Motor 2 tuning and limits.
-// Current gains make this a PI controller because kd is zero.
+// kd is now used as the velocity-tracking gain. The starting value is small
+// and should be tuned carefully on the real mechanism.
 MotorController motor2 = {
   "M2",
   M2_IN1, M2_IN2, &encoder2,
   M2_ENCODER_SIGN, M2_MOTOR_DIRECTION_SIGN, MOTOR_2_FEEDBACK,
 
-  1.21, 0.096, 0.0, 20.0,
+  0.6, 0.066, 0.025, 20.0,
   150, 255, 150,
   1.0, 5.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0,
   0.0, 0, 0.0,
   false, false, false, false, 0, 0, 0
 };
@@ -332,7 +345,13 @@ int serialEscapeState = 0;
 
 const float OSCILLATION_FREQUENCY_HZ = 0.05;
 const float OSCILLATION_CENTER_DEG = 45.0;
-const float OSCILLATION_AMPLITUDE_DEG = 45.0;
+const float OSCILLATION_AMPLITUDE_DEG = 35.0;
+
+// The measured angular velocity is calculated by differentiating the IMU
+// angle. Differentiation can amplify sensor noise, so this low-pass filter is
+// applied before velocity error is used by the controller. A smaller value is
+// smoother; a larger value reacts faster.
+const float VELOCITY_FILTER_ALPHA = 0.20;
 
 // ----------------------
 // Runtime timing
@@ -343,9 +362,9 @@ const float OSCILLATION_AMPLITUDE_DEG = 45.0;
 unsigned long lastControlUs = 0;
 unsigned long lastTelemetryMs = 0;
 
-
+// ======================================================
 // Function declarations
-
+// ======================================================
 // These declarations tell the compiler which functions are defined later.
 // They also provide a quick list of the program's main tasks.
 
@@ -376,6 +395,7 @@ void initializeControllerForTarget(MotorController& motor, float targetDeg);
 void updatePid(MotorController& motor, float dtSeconds);
 
 float calculateOscillationTarget(float timeSeconds);
+float calculateOscillationVelocity(float timeSeconds);
 void startOscillation(MotorController& motor);
 void stopOscillation(MotorController& motor);
 void updateOscillationTarget(MotorController& motor);
@@ -395,9 +415,9 @@ void printQuaternion(const char* label, Quat q);
 void printTelemetry();
 void printMenu();
 
-
+// ======================================================
 // Quaternion math
-
+// ======================================================
 
 // Makes a quaternion have a length of 1.
 // Normalization is required before using it for orientation calculations.
@@ -453,9 +473,9 @@ float quaternionAngleDeg(Quat q) {
   return 2.0 * acos(w) * 180.0 / PI;
 }
 
-
+// ======================================================
 // IMU filtering
-
+// ======================================================
 
 // Starts or restarts the elbow filter at a known angle.
 void resetJointAngleFilter(float startAngleDeg) {
@@ -515,9 +535,9 @@ float filterJointAngle(float rawDeg) {
   return filteredJointAngleDeg;
 }
 
-
+// ======================================================
 // IMU functions
-
+// ======================================================
 
 // Starts both I2C buses and both BNO055 sensors.
 // The function returns false when either sensor cannot be detected.
@@ -613,9 +633,9 @@ void zeroImus() {
   Serial.println("IMUs and encoders zeroed.");
 }
 
-
+// ======================================================
 // Feedback and motor helpers
-
+// ======================================================
 
 // Returns the angle selected for this motor's feedback source.
 float feedbackAngle(const MotorController& motor) {
@@ -678,9 +698,9 @@ void motorHold(MotorController& motor) {
   analogWrite(motor.in2, 255);
 }
 
-
+// ======================================================
 // PI/PID controller
-
+// ======================================================
 
 // Limits a value to the range 0.0 through 1.0.
 float clamp01(float value) {
@@ -709,6 +729,8 @@ void resetControllerState(MotorController& motor, bool deactivate) {
   motor.integralError = 0.0;
   motor.previousMeasurement = feedbackAngle(motor);
   motor.previousOutput = 0.0;
+  motor.desiredVelocityDegPerSec = 0.0;
+  motor.measuredVelocityDegPerSec = 0.0;
   motor.normalizedEffort = 0.0;
   motor.pwm = 0;
   motor.signedPwmCommand = 0.0;
@@ -733,6 +755,8 @@ void initializeControllerForTarget(
   motor.integralError = 0.0;
   motor.previousMeasurement = current;
   motor.previousOutput = 0.0;
+  motor.desiredVelocityDegPerSec = 0.0;
+  motor.measuredVelocityDegPerSec = 0.0;
   motor.normalizedEffort = 0.0;
   motor.pwm = 0;
   motor.signedPwmCommand = 0.0;
@@ -745,9 +769,11 @@ void initializeControllerForTarget(
 // 1. Read the selected feedback angle.
 // 2. Calculate target error.
 // 3. Check target tolerance and safety timeout.
-// 4. Update the integral term with anti-windup protection.
-// 5. Calculate P + I + D output.
-// 6. Convert output magnitude to PWM and output sign to direction.
+// 4. Calculate measured angular velocity from the IMU angle.
+// 5. Compare measured velocity with the desired trajectory velocity.
+// 6. Update the integral term with anti-windup protection.
+// 7. Calculate P + I + D output.
+// 8. Convert output magnitude to PWM and output sign to direction.
 void updatePid(MotorController& motor, float dtSeconds) {
   // Manual mode directly controls the motor, so PID must not overwrite it.
   if (motor.manualEnabled) {
@@ -829,10 +855,23 @@ void updatePid(MotorController& motor, float dtSeconds) {
     pwmLimit = motor.slowPwm;
   }
 
-  // Derivative on measurement avoids a derivative kick after target changes.
-  float measurementRate =
+  // Calculate angular velocity from the change in measured angle.
+  // The raw derivative can be noisy, so it is passed through a low-pass
+  // filter before it is used by the controller.
+  float rawMeasurementVelocity =
       (current - motor.previousMeasurement) / dtSeconds;
-  float derivativeError = -measurementRate;
+
+  motor.measuredVelocityDegPerSec =
+      VELOCITY_FILTER_ALPHA * rawMeasurementVelocity +
+      (1.0 - VELOCITY_FILTER_ALPHA) *
+          motor.measuredVelocityDegPerSec;
+
+  // This is the derivative of position error. For a fixed target, desired
+  // velocity is zero, so the term adds damping. During oscillation, desired
+  // velocity comes directly from the derivative of the cosine trajectory.
+  float velocityError =
+      motor.desiredVelocityDegPerSec -
+      motor.measuredVelocityDegPerSec;
 
   // Anti-windup check: when output is already at full effort in the same
   // direction as the error, more integral error would not help.
@@ -856,11 +895,14 @@ void updatePid(MotorController& motor, float dtSeconds) {
     motor.integralError = 0.0;
   }
 
-  // This is the PID equation: output = P + I + D.
+  // This is the trajectory-tracking PID equation.
+  // P corrects angle error.
+  // I corrects angle error that continues over time.
+  // D corrects velocity error.
   float controllerOutput =
       motor.kp * error +
       motor.ki * motor.integralError +
-      motor.kd * derivativeError;
+      motor.kd * velocityError;
 
   motor.previousError = error;
   motor.previousMeasurement = current;
@@ -894,9 +936,9 @@ void updatePid(MotorController& motor, float dtSeconds) {
   driveMotor(motor, direction, pwm);
 }
 
-
+// ======================================================
 // Fixed targets and oscillation
-
+// ======================================================
 
 // Calculates the moving target for oscillation.
 // At time zero the target is 0 degrees. It rises smoothly to 90 degrees,
@@ -905,6 +947,21 @@ float calculateOscillationTarget(float timeSeconds) {
   return OSCILLATION_CENTER_DEG -
       OSCILLATION_AMPLITUDE_DEG *
       cos(2.0 * PI * OSCILLATION_FREQUENCY_HZ * timeSeconds);
+}
+
+// Calculates desired angular velocity by differentiating the target function.
+//
+// target(t) = center - amplitude * cos(2*pi*f*t)
+// velocity(t) = amplitude * 2*pi*f * sin(2*pi*f*t)
+//
+// The result is in degrees per second because amplitude is in degrees.
+float calculateOscillationVelocity(float timeSeconds) {
+  float angularFrequency =
+      2.0 * PI * OSCILLATION_FREQUENCY_HZ;
+
+  return OSCILLATION_AMPLITUDE_DEG *
+      angularFrequency *
+      sin(angularFrequency * timeSeconds);
 }
 
 // Starts oscillation for one motor and initializes its PID state.
@@ -917,11 +974,19 @@ void startOscillation(MotorController& motor) {
       motor,
       calculateOscillationTarget(0.0)
   );
+  motor.desiredVelocityDegPerSec =
+      calculateOscillationVelocity(0.0);
 
   Serial.print(motor.name);
   Serial.print(" oscillation started at ");
   Serial.print(OSCILLATION_FREQUENCY_HZ, 3);
-  Serial.println(" Hz.");
+  Serial.print(" Hz. Maximum desired speed: " );
+  Serial.print(
+      OSCILLATION_AMPLITUDE_DEG *
+      2.0 * PI * OSCILLATION_FREQUENCY_HZ,
+      2
+  );
+  Serial.println(" deg/s.");
 }
 
 // Stops changing the target. This function does not stop motor output by
@@ -929,6 +994,7 @@ void startOscillation(MotorController& motor) {
 void stopOscillation(MotorController& motor) {
   motor.oscillationEnabled = false;
   motor.oscillationStartMs = 0;
+  motor.desiredVelocityDegPerSec = 0.0;
 }
 
 // Updates the motor's target angle during every control cycle.
@@ -941,6 +1007,8 @@ void updateOscillationTarget(MotorController& motor) {
       (millis() - motor.oscillationStartMs) / 1000.0;
 
   motor.targetDeg = calculateOscillationTarget(elapsedSeconds);
+  motor.desiredVelocityDegPerSec =
+      calculateOscillationVelocity(elapsedSeconds);
   motor.active = true;
   motor.holding = false;
 }
@@ -987,6 +1055,8 @@ void startManualDrive(MotorController& motor, int direction) {
   motor.integralError = 0.0;
   motor.previousMeasurement = feedbackAngle(motor);
   motor.previousOutput = 0.0;
+  motor.desiredVelocityDegPerSec = 0.0;
+  motor.measuredVelocityDegPerSec = 0.0;
 
   // Apply the command immediately instead of waiting for the next loop cycle.
   updateManualDrive(motor);
@@ -1058,9 +1128,9 @@ void stopAllMotion(const char* reason) {
   Serial.println(reason);
 }
 
-
+// ======================================================
 // Serial commands
-
+// ======================================================
 
 // Reads every available serial character without blocking the control loop.
 // Arrow keys are received as ANSI escape sequences: ESC [ D for left and
@@ -1167,9 +1237,9 @@ void handleArrowCommand(char arrowCode) {
   }
 }
 
-
+// ======================================================
 // Telemetry
-
+// ======================================================
 
 // Converts internal motor state into a readable mode name.
 const char* controlModeName(const MotorController& motor) {
@@ -1226,6 +1296,25 @@ void printTelemetry() {
   float m2Error = motor2.active && !motor2.manualEnabled
       ? motor2.targetDeg - m2Current
       : 0.0;
+
+  // Send the exact velocity values used inside the controller.
+  // The temporary angle/velocity visualizer reads this line directly.
+  // Sending it before STATE makes sure the matching velocity values are
+  // available when the Python program receives the new state sample.
+  //
+  // VELOCITY,time_ms,
+  // m1_desired_velocity,m1_measured_velocity,
+  // m2_desired_velocity,m2_measured_velocity
+  Serial.print("VELOCITY,");
+  Serial.print(now);
+  Serial.print(",");
+  Serial.print(motor1.desiredVelocityDegPerSec, 4);
+  Serial.print(",");
+  Serial.print(motor1.measuredVelocityDegPerSec, 4);
+  Serial.print(",");
+  Serial.print(motor2.desiredVelocityDegPerSec, 4);
+  Serial.print(",");
+  Serial.println(motor2.measuredVelocityDegPerSec, 4);
 
   // Parsed by final_dual_motor_monitor.py.
   // STATE,time_ms,selected,
@@ -1286,7 +1375,7 @@ void printMenu() {
   Serial.println("j       : Select Motor 1");
   Serial.println("k       : Select Motor 2");
   Serial.println("0-9     : Set selected motor to a preset target");
-  Serial.println("x       : Start/stop selected motor oscillation");
+  Serial.println("x       : Start/stop angle + velocity oscillation tracking");
   Serial.println("left / a : Selected motor reverse/down at manual PWM");
   Serial.println("right / d: Selected motor forward/up at manual PWM");
   Serial.println("s/e/p   : Emergency stop both motors");
@@ -1304,9 +1393,9 @@ void printMenu() {
   Serial.println();
 }
 
-
+// ======================================================
 // Arduino setup and loop
-
+// ======================================================
 
 // setup() runs once after the board powers on or resets.
 // It starts serial communication, prepares the motor pins, starts the IMUs,
