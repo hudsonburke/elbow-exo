@@ -20,8 +20,8 @@ Keyboard controls inside the plot window:
     k       Select Motor 2
     0-9     Set a fixed-angle target for the selected motor
     x       Start or stop oscillation for the selected motor
-    left    Move the selected motor in reverse/down at manual PWM (sends a)
-    right   Move the selected motor forward/up at manual PWM (sends d)
+    left/a  Move the selected motor in reverse/down at manual PWM
+    right/d Move the selected motor forward/up at manual PWM
     s       Emergency stop both motors
     e       Emergency stop both motors
     p/space Emergency stop both motors
@@ -251,6 +251,7 @@ def send_serial_command(text: str) -> None:
 
     try:
         serial_connection.write(text.encode("utf-8"))
+        serial_connection.flush()
         print(f"Sent: {text!r}")
 
     except (serial.SerialException, OSError) as error:
@@ -869,14 +870,15 @@ def main() -> None:
         elif key == "x":
             send_serial_command("x")
 
-        elif key == "left":
-            # Send one simple command byte instead of an ANSI escape sequence.
-            # This is more reliable when commands pass through pyserial.
+        elif key in ["left", "a"]:
+            # Both the left arrow and the A key request reverse/down movement.
+            # A single-byte command is more dependable than forwarding an ANSI
+            # arrow-key escape sequence through pyserial.
             send_serial_command("a")
             print("Manual reverse/down command sent to selected motor.")
 
-        elif key == "right":
-            # The controller interprets d as manual forward/up movement.
+        elif key in ["right", "d"]:
+            # Both the right arrow and the D key request forward/up movement.
             send_serial_command("d")
             print("Manual forward/up command sent to selected motor.")
 
@@ -1018,7 +1020,7 @@ def main() -> None:
 
         status_lines = [
             (
-                "Keys: j select M1 | k select M2 | left/right manual | "
+                "Keys: j select M1 | k select M2 | left/a right/d manual | "
                 "0-9 target | x oscillation | s/space stop | r zero | "
                 "g reset | q quit"
             ),
@@ -1033,7 +1035,7 @@ def main() -> None:
                 f"{float(telemetry['m1_u_cmd']):.0f}, counts "
                 f"{telemetry['m1_counts']}"
             ),
-            
+            (
                 f"M2 {telemetry['m2_mode']}: target "
                 f"{float(telemetry['m2_target']):.1f}°, current "
                 f"{float(telemetry['m2_current']):.1f}°, error "

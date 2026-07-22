@@ -51,7 +51,8 @@
 // -------------------------
 // - Idle: the motor is not moving.
 // - Fixed target: the motor moves to a selected angle and holds it.
-// - Oscillation: the target moves smoothly from 0 to 90 degrees and back.
+// - Oscillation: the target moves smoothly between center-amplitude and
+//   center+amplitude. With the current settings, that is 10 to 80 degrees.
 // - Holding: the motor applies active braking near a fixed target.
 // - Manual: the selected motor moves directly at a fixed PWM without PID.
 //
@@ -73,8 +74,11 @@
 // - Test one motor at a time before testing both motors together.
 // - Confirm the motor direction signs before connecting the system to a user.
 // - Confirm that active braking is safe for the selected motor driver.
-// - Manual arrow control is open-loop and does not stop at an angle target.
-// - Always press a stop key before the mechanism reaches a physical limit.
+// - Manual arrow control is open-loop, but Motor 2 is blocked at the
+//   configured elbow lower and upper limits.
+// - Motor 2 uses its encoder as the lower-limit reference. Verify that
+//   encoder counts increase while the elbow flexes upward.
+// - The 100-degree upper limit is a backup safety limit, not a target.
 // - Keep an emergency power-disconnect method available during testing.
 // ======================================================
 
@@ -132,8 +136,26 @@ bool imuOk = false;
 
 // Main angle measurements used by the controllers.
 float upperArmAngleDeg = 0.0;  // Upper arm relative to its zero position
-float rawJointAngleDeg = 0.0;  // Unfiltered elbow angle
-float jointAngleDeg = 0.0;     // Filtered elbow angle used for control
+float rawJointAngleDeg = 0.0;  // Unfiltered elbow angle before drift correction
+float jointAngleDeg = 0.0;     // Corrected elbow angle used for control
+
+// The BNO055 relative angle can slowly drift even when the real elbow is at
+// full extension. This offset is updated only when the Motor 2 encoder
+// confirms that the cable is at its known lower mechanical limit.
+float elbowZeroOffsetDeg = 0.0;
+
+// BNO055 calibration values range from 0 (not calibrated) to 3 (fully
+// calibrated). They are sent to telemetry for diagnosis. They do not
+// automatically stop the system in this version.
+uint8_t upperSystemCal = 0;
+uint8_t upperGyroCal = 0;
+uint8_t upperAccelCal = 0;
+uint8_t upperMagCal = 0;
+
+uint8_t forearmSystemCal = 0;
+uint8_t forearmGyroCal = 0;
+uint8_t forearmAccelCal = 0;
+uint8_t forearmMagCal = 0;
 
 // ----------------------
 // Elbow-angle spike filter
@@ -195,6 +217,55 @@ const int M2_ENCODER_SIGN = 1;
 // Manual arrow-key speed. This is the raw PWM used while an arrow command is
 // active. Lower this value when slower manual positioning is needed.
 const int MANUAL_PWM = 125;
+
+// ----------------------
+// Elbow mechanical limits and drift correction
+// ----------------------
+//
+// IMPORTANT ENCODER NOTE
+// ----------------------
+// After zeroImus() is called at full extension, Motor 2 encoder counts should
+// move away from zero as the elbow flexes and return near zero at extension.
+// The lower-limit check below uses the absolute distance from zero, so it works
+// whether flexion produces positive or negative counts. M2_ENCODER_SIGN still
+// controls the sign shown in telemetry and is important if the optional encoder
+// upper limit is enabled later.
+//
+// The lower limit uses encoder counts because the encoder does not experience
+// the same orientation drift as the IMUs. The upper limit uses the corrected
+// elbow angle and can optionally also use an encoder count after calibration.
+
+const float ELBOW_MIN_PHYSICAL_DEG = 0.0;
+const float ELBOW_MAX_SAFE_DEG = 100.0;
+const float ELBOW_UPPER_LIMIT_RELEASE_DEG = 98.0;
+
+// At full extension, encoder2 is set to zero.
+// Enter and release margins add hysteresis and prevent limit chatter.
+const long M2_LOWER_LIMIT_COUNTS = 0;
+const long M2_LOWER_LIMIT_ENTER_MARGIN_COUNTS = 100;
+const long M2_LOWER_LIMIT_RELEASE_MARGIN_COUNTS = 300;
+
+// Optional encoder-based upper limit.
+// Leave false until M2_UPPER_LIMIT_COUNTS has been measured safely.
+const bool USE_M2_ENCODER_UPPER_LIMIT = false;
+const long M2_UPPER_LIMIT_COUNTS = 90000;
+const long M2_UPPER_LIMIT_RELEASE_COUNTS = 89000;
+
+// Automatic elbow-only zero correction.
+// The encoder must remain at the lower limit while the elbow is nearly still.
+// This corrects IMU drift without changing Motor 1's IMU reference.
+const bool ENABLE_ELBOW_AUTO_ZERO = true;
+const unsigned long LOWER_LIMIT_CONFIRM_MS = 400;
+const unsigned long MIN_ZERO_CORRECTION_INTERVAL_MS = 2000;
+const float LOWER_LIMIT_MAX_MEASURED_VELOCITY_DEG_S = 1.0;
+const float MIN_ELBOW_ZERO_CORRECTION_DEG = 0.50;
+
+// Runtime safety state.
+bool motor2LowerLimitActive = false;
+bool motor2UpperLimitActive = false;
+unsigned long lowerLimitStillStartMs = 0;
+unsigned long lastElbowZeroCorrectionMs = 0;
+unsigned long elbowZeroCorrectionCount = 0;
 
 // ----------------------
 // Feedback selection
@@ -340,8 +411,9 @@ int serialEscapeState = 0;
 // ----------------------
 // Oscillation settings
 // ----------------------
-// The target follows a smooth cosine wave from 0 to 90 degrees and back.
-// At 0.05 Hz, one complete cycle takes 20 seconds.
+// The target follows a smooth cosine wave. With center=45 and amplitude=35,
+// it moves from 10 to 80 degrees and back. At 0.05 Hz, one complete cycle
+// takes 20 seconds.
 
 const float OSCILLATION_FREQUENCY_HZ = 0.05;
 const float OSCILLATION_CENTER_DEG = 45.0;
@@ -380,10 +452,22 @@ float filterJointAngle(float rawDeg);
 bool startImus();
 void readImus();
 void zeroImus();
+void readImuCalibrationStatus();
 
 float feedbackAngle(const MotorController& motor);
 const char* feedbackName(const MotorController& motor);
 long encoderCounts(const MotorController& motor);
+
+bool isMotor2(const MotorController& motor);
+bool readMotor2LowerLimit();
+bool readMotor2UpperLimit();
+bool motorDirectionBlockedByElbowSafety(
+    const MotorController& motor,
+    int direction
+);
+void clearMotorCommandAtLimit(MotorController& motor);
+void correctElbowZeroAtLowerLimit();
+void updateElbowSafetyState();
 
 void driveMotor(MotorController& motor, int direction, int pwm);
 void motorOff(MotorController& motor);
@@ -596,7 +680,53 @@ void readImus() {
 
   upperArmAngleDeg = quaternionAngleDeg(qUpperZeroed);
   rawJointAngleDeg = quaternionAngleDeg(qJointZeroed);
-  jointAngleDeg = filterJointAngle(rawJointAngleDeg);
+
+  // First filter the uncorrected relative IMU angle. Then subtract the
+  // encoder-confirmed drift offset. This keeps filtering and drift correction
+  // as two separate operations.
+  float filteredUncorrectedJointDeg =
+      filterJointAngle(rawJointAngleDeg);
+
+  jointAngleDeg =
+      filteredUncorrectedJointDeg - elbowZeroOffsetDeg;
+
+  // The elbow cannot physically extend below zero. Only clamp small negative
+  // values caused by normal filter noise; larger negative values remain
+  // visible so a bad offset can be diagnosed.
+  if (jointAngleDeg < 0.0 && jointAngleDeg > -2.0) {
+    jointAngleDeg = 0.0;
+  }
+}
+
+// Reads BNO055 calibration status for telemetry.
+// Each value ranges from 0 to 3.
+void readImuCalibrationStatus() {
+  if (!imuOk) {
+    upperSystemCal = 0;
+    upperGyroCal = 0;
+    upperAccelCal = 0;
+    upperMagCal = 0;
+
+    forearmSystemCal = 0;
+    forearmGyroCal = 0;
+    forearmAccelCal = 0;
+    forearmMagCal = 0;
+    return;
+  }
+
+  bnoUpper.getCalibration(
+      &upperSystemCal,
+      &upperGyroCal,
+      &upperAccelCal,
+      &upperMagCal
+  );
+
+  bnoForearm.getCalibration(
+      &forearmSystemCal,
+      &forearmGyroCal,
+      &forearmAccelCal,
+      &forearmMagCal
+  );
 }
 
 // Saves the current arm position as zero and clears the encoders.
@@ -622,10 +752,17 @@ void zeroImus() {
   upperArmAngleDeg = 0.0;
   rawJointAngleDeg = 0.0;
   jointAngleDeg = 0.0;
+  elbowZeroOffsetDeg = 0.0;
   resetJointAngleFilter(0.0);
 
   encoder1.write(0);
   encoder2.write(0);
+
+  motor2LowerLimitActive = true;
+  motor2UpperLimitActive = false;
+  lowerLimitStillStartMs = 0;
+  lastElbowZeroCorrectionMs = millis();
+  elbowZeroCorrectionCount = 0;
 
   motor1.targetDeg = 0.0;
   motor2.targetDeg = 0.0;
@@ -660,6 +797,209 @@ const char* feedbackName(const MotorController& motor) {
 // telemetry and remain available for future speed or position control.
 long encoderCounts(const MotorController& motor) {
   return motor.encoderSign * motor.encoder->read();
+}
+
+// Returns true only for the controller connected to the elbow cable motor.
+bool isMotor2(const MotorController& motor) {
+  return &motor == &motor2;
+}
+
+// Reads the encoder-based lower limit with hysteresis.
+// Full extension is a small WINDOW around the saved zero count. Using the
+// absolute distance from zero is important: the old <= comparison treated
+// every negative encoder value as being at the lower limit, which could block
+// reverse/down movement during the entire range of motion when the encoder
+// direction was negative.
+bool readMotor2LowerLimit() {
+  long currentCounts = encoderCounts(motor2);
+  long distanceFromLowerLimit = labs(
+      currentCounts - M2_LOWER_LIMIT_COUNTS
+  );
+
+  if (motor2LowerLimitActive) {
+    return distanceFromLowerLimit <=
+        M2_LOWER_LIMIT_RELEASE_MARGIN_COUNTS;
+  }
+
+  return distanceFromLowerLimit <=
+      M2_LOWER_LIMIT_ENTER_MARGIN_COUNTS;
+}
+
+// Reads the upper elbow safety limit with hysteresis.
+// The IMU angle limit is always enabled. The encoder upper limit is optional.
+bool readMotor2UpperLimit() {
+  bool angleLimit;
+
+  if (motor2UpperLimitActive) {
+    angleLimit =
+        jointAngleDeg >= ELBOW_UPPER_LIMIT_RELEASE_DEG;
+  } else {
+    angleLimit =
+        jointAngleDeg >= ELBOW_MAX_SAFE_DEG;
+  }
+
+  bool encoderLimit = false;
+
+  if (USE_M2_ENCODER_UPPER_LIMIT) {
+    long currentCounts = encoderCounts(motor2);
+
+    if (motor2UpperLimitActive) {
+      encoderLimit =
+          currentCounts >= M2_UPPER_LIMIT_RELEASE_COUNTS;
+    } else {
+      encoderLimit =
+          currentCounts >= M2_UPPER_LIMIT_COUNTS;
+    }
+  }
+
+  return angleLimit || encoderLimit;
+}
+
+// Blocks only the unsafe direction.
+// At the lower limit, Motor 2 may still move forward/up.
+// At the upper limit, Motor 2 may still move reverse/down.
+bool motorDirectionBlockedByElbowSafety(
+    const MotorController& motor,
+    int direction
+) {
+  if (!isMotor2(motor)) {
+    return false;
+  }
+
+  if (direction == REVERSE && motor2LowerLimitActive) {
+    return true;
+  }
+
+  if (direction == FORWARD && motor2UpperLimitActive) {
+    return true;
+  }
+
+  return false;
+}
+
+// Clears motor output and all stored control effort when a mechanical limit
+// blocks motion. The active trajectory is preserved, so the controller can
+// move safely away from the limit when the target changes direction.
+void clearMotorCommandAtLimit(MotorController& motor) {
+  motorOff(motor);
+
+  float current = feedbackAngle(motor);
+
+  motor.integralError = 0.0;
+  motor.previousOutput = 0.0;
+  motor.previousMeasurement = current;
+  motor.previousError = motor.targetDeg - current;
+  motor.measuredVelocityDegPerSec = 0.0;
+
+  motor.normalizedEffort = 0.0;
+  motor.pwm = 0;
+  motor.signedPwmCommand = 0.0;
+  motor.holding = false;
+}
+
+// Corrects only the elbow feedback zero.
+// It does not replace the upper-arm or forearm quaternion zero references and
+// does not stop Motor 1.
+void correctElbowZeroAtLowerLimit() {
+  float oldCorrectedAngleDeg = jointAngleDeg;
+
+  // Avoid repeated corrections for very small normal noise.
+  if (fabs(oldCorrectedAngleDeg) <
+      MIN_ELBOW_ZERO_CORRECTION_DEG) {
+    return;
+  }
+
+  motorOff(motor2);
+
+  // filteredJointAngleDeg is the filtered angle before offset subtraction.
+  // Saving it as the offset makes the corrected elbow angle equal to zero.
+  elbowZeroOffsetDeg = filteredJointAngleDeg;
+  jointAngleDeg = ELBOW_MIN_PHYSICAL_DEG;
+
+  // Re-anchor the encoder at the known mechanical lower limit.
+  encoder2.write(0);
+
+  // A manual reverse command must not continue against the limit.
+  if (motor2.manualEnabled &&
+      motor2.manualDirection == REVERSE) {
+    motor2.manualEnabled = false;
+    motor2.manualDirection = 0;
+  }
+
+  clearMotorCommandAtLimit(motor2);
+
+  lastElbowZeroCorrectionMs = millis();
+  elbowZeroCorrectionCount++;
+
+  Serial.print("ELBOW_ZERO_CORRECTED,");
+  Serial.print(lastElbowZeroCorrectionMs);
+  Serial.print(",");
+  Serial.print(oldCorrectedAngleDeg, 4);
+  Serial.print(",");
+  Serial.print(elbowZeroOffsetDeg, 4);
+  Serial.print(",");
+  Serial.println(elbowZeroCorrectionCount);
+}
+
+// Updates lower/upper limit states and performs confirmed elbow drift
+// correction while the mechanism is resting at full extension.
+void updateElbowSafetyState() {
+  bool previousLower = motor2LowerLimitActive;
+  bool previousUpper = motor2UpperLimitActive;
+
+  motor2LowerLimitActive = readMotor2LowerLimit();
+  motor2UpperLimitActive = readMotor2UpperLimit();
+
+  if (motor2LowerLimitActive != previousLower) {
+    Serial.print("LIMIT,M2,LOWER,");
+    Serial.println(motor2LowerLimitActive ? 1 : 0);
+  }
+
+  if (motor2UpperLimitActive != previousUpper) {
+    Serial.print("LIMIT,M2,UPPER,");
+    Serial.println(motor2UpperLimitActive ? 1 : 0);
+  }
+
+  // Never change the elbow zero while Motor 2 is under direct manual control.
+  // Manual movement is often used to leave the lower limit, and an automatic
+  // zero correction during that movement can briefly remove the motor output.
+  if (!ENABLE_ELBOW_AUTO_ZERO ||
+      !motor2LowerLimitActive ||
+      motor2.manualEnabled) {
+    lowerLimitStillStartMs = 0;
+    return;
+  }
+
+  bool elbowNearlyStill =
+      fabs(motor2.measuredVelocityDegPerSec) <=
+      LOWER_LIMIT_MAX_MEASURED_VELOCITY_DEG_S;
+
+  if (!elbowNearlyStill) {
+    lowerLimitStillStartMs = 0;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (lowerLimitStillStartMs == 0) {
+    lowerLimitStillStartMs = now;
+    return;
+  }
+
+  bool confirmedLongEnough =
+      now - lowerLimitStillStartMs >=
+      LOWER_LIMIT_CONFIRM_MS;
+
+  bool correctionIntervalPassed =
+      now - lastElbowZeroCorrectionMs >=
+      MIN_ZERO_CORRECTION_INTERVAL_MS;
+
+  if (confirmedLongEnough && correctionIntervalPassed) {
+    correctElbowZeroAtLowerLimit();
+
+    // Require another complete confirmation period before a later correction.
+    lowerLimitStillStartMs = now;
+  }
 }
 
 // Sends direction and PWM to one motor driver.
@@ -904,6 +1244,20 @@ void updatePid(MotorController& motor, float dtSeconds) {
       motor.ki * motor.integralError +
       motor.kd * velocityError;
 
+  // Determine the requested direction before saving the output. If Motor 2
+  // is already at a mechanical limit, block only the direction that would
+  // push farther into that limit and erase stored integral effort.
+  int direction =
+      controllerOutput >= 0.0 ? FORWARD : REVERSE;
+
+  if (motorDirectionBlockedByElbowSafety(
+          motor,
+          direction
+      )) {
+    clearMotorCommandAtLimit(motor);
+    return;
+  }
+
   motor.previousError = error;
   motor.previousMeasurement = current;
   motor.previousOutput = controllerOutput;
@@ -924,7 +1278,6 @@ void updatePid(MotorController& motor, float dtSeconds) {
   }
 
   // The sign controls direction. The size controls PWM effort.
-  int direction = controllerOutput >= 0.0 ? FORWARD : REVERSE;
   float signedPwm =
       direction * motor.motorDirectionSign * pwm;
 
@@ -941,8 +1294,9 @@ void updatePid(MotorController& motor, float dtSeconds) {
 // ======================================================
 
 // Calculates the moving target for oscillation.
-// At time zero the target is 0 degrees. It rises smoothly to 90 degrees,
-// returns smoothly to 0 degrees, and then repeats.
+// At time zero the target is center-amplitude. It rises smoothly to
+// center+amplitude, returns, and then repeats. With the current settings,
+// the planned range is 10 to 80 degrees.
 float calculateOscillationTarget(float timeSeconds) {
   return OSCILLATION_CENTER_DEG -
       OSCILLATION_AMPLITUDE_DEG *
@@ -1043,12 +1397,45 @@ void startManualDrive(MotorController& motor, int direction) {
     return;
   }
 
+  // Convert every manual request into one of the two valid logical directions.
+  int requestedDirection = direction >= 0 ? FORWARD : REVERSE;
+
+  // Refresh the sensor and limit states immediately. This avoids using a stale
+  // limit flag when a manual command arrives between normal 100 Hz updates.
+  readImus();
+  updateElbowSafetyState();
+
+  // Block only a direction that would push Motor 2 farther into a mechanical
+  // limit. The opposite direction remains available so the user can move away.
+  if (motorDirectionBlockedByElbowSafety(
+          motor,
+          requestedDirection
+      )) {
+    motorOff(motor);
+    resetControllerState(motor, true);
+    motor.targetDeg = feedbackAngle(motor);
+
+    Serial.print("MANUAL_BLOCKED,");
+    Serial.print(motor.name);
+    Serial.print(",");
+    Serial.print(
+        requestedDirection == FORWARD
+            ? "upper_limit"
+            : "lower_limit"
+    );
+    Serial.print(",counts=");
+    Serial.print(encoderCounts(motor));
+    Serial.print(",angle=");
+    Serial.println(feedbackAngle(motor), 3);
+    return;
+  }
+
   stopOscillation(motor);
 
   motor.active = false;
   motor.holding = false;
   motor.manualEnabled = true;
-  motor.manualDirection = direction >= 0 ? FORWARD : REVERSE;
+  motor.manualDirection = requestedDirection;
 
   motor.targetDeg = feedbackAngle(motor);
   motor.previousError = 0.0;
@@ -1079,6 +1466,31 @@ void updateManualDrive(MotorController& motor) {
     motor.pwm = 0;
     motor.normalizedEffort = 0.0;
     motor.signedPwmCommand = 0.0;
+    return;
+  }
+
+  if (motorDirectionBlockedByElbowSafety(
+          motor,
+          motor.manualDirection
+      )) {
+    int blockedDirection = motor.manualDirection;
+
+    motor.manualEnabled = false;
+    motor.manualDirection = 0;
+    clearMotorCommandAtLimit(motor);
+
+    Serial.print("MANUAL_LIMIT_STOP,");
+    Serial.print(motor.name);
+    Serial.print(",");
+    Serial.print(
+        blockedDirection == FORWARD
+            ? "upper_limit"
+            : "lower_limit"
+    );
+    Serial.print(",counts=");
+    Serial.print(encoderCounts(motor));
+    Serial.print(",angle=");
+    Serial.println(feedbackAngle(motor), 3);
     return;
   }
 
@@ -1297,6 +1709,55 @@ void printTelemetry() {
       ? motor2.targetDeg - m2Current
       : 0.0;
 
+  readImuCalibrationStatus();
+
+  // Calibration telemetry is separate so the existing STATE parser remains
+  // compatible with older Python visualizers.
+  //
+  // CALIBRATION,time_ms,
+  // upper_system,upper_gyro,upper_accel,upper_mag,
+  // forearm_system,forearm_gyro,forearm_accel,forearm_mag
+  Serial.print("CALIBRATION,");
+  Serial.print(now);
+  Serial.print(",");
+  Serial.print(upperSystemCal);
+  Serial.print(",");
+  Serial.print(upperGyroCal);
+  Serial.print(",");
+  Serial.print(upperAccelCal);
+  Serial.print(",");
+  Serial.print(upperMagCal);
+  Serial.print(",");
+  Serial.print(forearmSystemCal);
+  Serial.print(",");
+  Serial.print(forearmGyroCal);
+  Serial.print(",");
+  Serial.print(forearmAccelCal);
+  Serial.print(",");
+  Serial.println(forearmMagCal);
+
+  // Safety telemetry:
+  // SAFETY,time_ms,lower_active,upper_active,encoder_counts,
+  // raw_joint,filtered_uncorrected,zero_offset,corrected_joint,corrections
+  Serial.print("SAFETY,");
+  Serial.print(now);
+  Serial.print(",");
+  Serial.print(motor2LowerLimitActive ? 1 : 0);
+  Serial.print(",");
+  Serial.print(motor2UpperLimitActive ? 1 : 0);
+  Serial.print(",");
+  Serial.print(encoderCounts(motor2));
+  Serial.print(",");
+  Serial.print(rawJointAngleDeg, 4);
+  Serial.print(",");
+  Serial.print(filteredJointAngleDeg, 4);
+  Serial.print(",");
+  Serial.print(elbowZeroOffsetDeg, 4);
+  Serial.print(",");
+  Serial.print(jointAngleDeg, 4);
+  Serial.print(",");
+  Serial.println(elbowZeroCorrectionCount);
+
   // Send the exact velocity values used inside the controller.
   // The temporary angle/velocity visualizer reads this line directly.
   // Sending it before STATE makes sure the matching velocity values are
@@ -1389,6 +1850,13 @@ void printMenu() {
   Serial.println(feedbackName(motor2));
   Serial.print("Currently selected: ");
   Serial.println(selectedMotor->name);
+  Serial.print("Motor 2 lower encoder limit counts: ");
+  Serial.println(M2_LOWER_LIMIT_COUNTS);
+  Serial.print("Motor 2 upper safe angle: ");
+  Serial.print(ELBOW_MAX_SAFE_DEG, 1);
+  Serial.println(" deg");
+  Serial.print("Elbow automatic zero correction: ");
+  Serial.println(ENABLE_ELBOW_AUTO_ZERO ? "enabled" : "disabled");
   Serial.println("=================================================");
   Serial.println();
 }
@@ -1470,6 +1938,11 @@ void loop() {
   // Oscillation changes the targets before the PID controllers run.
   updateOscillationTarget(motor1);
   updateOscillationTarget(motor2);
+
+  // Update encoder/angle limit states before either manual or PID output is
+  // allowed to reach the motor driver. This also performs confirmed
+  // elbow-only drift correction at full extension.
+  updateElbowSafetyState();
 
   // Manual mode bypasses PID and applies a direct PWM command. A motor that
   // is not in manual mode continues using its normal PID controller.
