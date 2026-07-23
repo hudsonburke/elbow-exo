@@ -36,8 +36,8 @@
 Adafruit_BNO055 bnoUpper(0, 0x28, &Wire);
 Adafruit_BNO055 bnoForearm(1, 0x28, &Wire1);
 
-const unsigned long SAMPLE_US = 10000;  // 100 Hz IMU/math update
-const unsigned long PRINT_MS  = 100;    // 10 Hz serial output
+const unsigned long SAMPLE_US = 10000;  //  Hz IMU/math update
+const unsigned long PRINT_MS  = 80;    // 10 Hz serial output
 
 // Anatomical axes expressed in the zeroed joint frame.
 // Keep FOREARM_LONG_AXIS at +X if that matches the physical IMU mounting.
@@ -152,7 +152,11 @@ imu::Quaternion quatFromAxisAngle(const Vec3& axis, float angleRad) {
 Vec3 rotateVector(const Vec3& v, const imu::Quaternion& q) {
   imu::Quaternion vq(0.0, v.x, v.y, v.z);
   imu::Quaternion rq = q * vq * q.conjugate();
-  return {rq.x(), rq.y(), rq.z()};
+  return {
+    static_cast<float>(rq.x()),
+    static_cast<float>(rq.y()),
+    static_cast<float>(rq.z())
+  };
 }
 
 // Signed angle from 'from' to 'to' about 'axis'.
@@ -294,7 +298,10 @@ void printOutput() {
 
   Serial.println();
  
-
+  Serial.print("Upper Quat: ");
+  printQuat("", qUpperZeroed);
+  Serial.print("Lower Quat: ");
+  printQuat("", qForearmZeroed);
   Serial.print("ElbowFlexDeg: ");
   Serial.print(elbowFlexDeg, 2);
   Serial.print(" | ForearmPronDeg: ");
@@ -325,7 +332,7 @@ void checkSerial() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   delay(1500);
 
   // Start the Teensy's two independent hardware I2C buses.
@@ -335,8 +342,13 @@ void setup() {
   Serial.println("Starting BNO055 IMUs in default fusion mode...");
 
   imuUpperOk = bnoUpper.begin();
+  if (imuUpperOk) {
+    delay(500);
+  }
   imuForearmOk = bnoForearm.begin();
-
+  if (imuForearmOk) {
+    delay(500);
+  }
   Serial.println("Upper-arm IMU is on Wire; forearm IMU is on Wire1.");
 
   Serial.print("Upper IMU: ");
