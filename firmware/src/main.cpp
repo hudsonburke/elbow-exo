@@ -384,8 +384,8 @@ MotorController motor2 = {
   M2_IN1, M2_IN2, &encoder2,
   M2_ENCODER_SIGN, M2_MOTOR_DIRECTION_SIGN, MOTOR_2_FEEDBACK,
 
-  0.6, 0.066, 0.025, 20.0,
-  150, 255, 150,
+  0.75, 0.055, 0.0, 20.0,
+  105, 255, 150,
   1.0, 5.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
