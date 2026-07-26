@@ -7,96 +7,64 @@
 #include <utility/imumaths.h>
 
 // ======================================================
-// FINAL DUAL-MOTOR, DUAL-IMU CONTROLLER
+// FINAL DUAL-MOTOR CONTROLLER
 // ======================================================
 //
-// PURPOSE
-// -------
-// This program controls two DC motors using feedback from two BNO055 IMUs.
-// Each motor has its own PI/PID controller, target angle, encoder reading,
-// safety timeout, and oscillation mode.
+// Name guide:
+// - ang = angle
+// - deg = degrees
+// - vel = velocity
+// - tgt = target
+// - pwm = motor command
+// - int = integral
+// - prev = previous
+// - cnt = count
+// - lim = limit
 //
-// The program was cleaned for the final product. Test-only features such as
-// constant-PWM identification trials, trial IDs, and CSV events are not
-// included. Manual arrow-key driving is kept because it is useful for setup,
-// positioning, and controlled troubleshooting of the final system.
+// All custom variable names are 10 characters or less.
 //
-// HARDWARE USED
-// -------------
-// 1. Upper-arm BNO055 IMU
-// 2. Forearm BNO055 IMU
-// 3. Motor 1 and its encoder
-// 4. Motor 2 and its encoder
-// 5. A microcontroller with Wire and Wire1 I2C buses
+// This program controls two motors with two BNO055 IMUs.
+// Motor 1 uses the upper-arm angle. Motor 2 uses the elbow angle.
 //
-// MAIN CONTROL IDEA
-// -----------------
-// 1. Read the two IMUs.
-// 2. Calculate the upper-arm angle and the relative elbow angle.
-// 3. Compare each motor's target angle with its measured angle.
-// 4. During oscillation, calculate desired angular velocity from the
-//    derivative of the desired-angle function.
-// 5. Use position error and velocity error in the PI/PID controller.
-// 6. Convert the controller output into a PWM value and direction.
-// 7. Send the PWM command to the motor driver.
-// 8. Repeat this process at 100 Hz.
+// Fixed targets use PI control. Oscillation also uses velocity feedback.
+// Motor 2 includes two protections:
+// 1. A limit on the velocity correction during an IMU spike.
+// 2. A small delay before changing motor direction near zero effort.
 //
-// MOTOR FEEDBACK
-// --------------
-// Motor 1 currently uses the upper-arm angle.
-// Motor 2 currently uses the relative elbow-joint angle.
-// These choices can be changed in the "Feedback selection" section.
+// This final version does not run test trials or collect CSV data.
+// It still sends live serial values to the Python monitor.
 //
-// AVAILABLE OPERATING MODES
-// -------------------------
-// - Idle: the motor is not moving.
-// - Fixed target: the motor moves to a selected angle and holds it.
-// - Oscillation: the target moves smoothly between center-amplitude and
-//   center+amplitude. With the current settings, that is 10 to 80 degrees.
-// - Holding: the motor applies active braking near a fixed target.
-// - Manual: the selected motor moves directly at a fixed PWM without PID.
-//
-// SERIAL COMMANDS
-// ---------------
-// j       Select Motor 1
-// k       Select Motor 2
-// 0-9     Move the selected motor to a preset angle
-// x       Start or stop oscillation for the selected motor
-// left/a  Move the selected motor in reverse/down manually
-// right/d Move the selected motor forward/up manually
-// s/e/p   Stop both motors
-// space   Stop both motors
-// r       Zero both IMUs and both encoders
+// Main keys:
+// j/k     Select Motor 1 or Motor 2
+// 0-9     Send a preset target angle
+// x       Start or stop oscillation
+// a/d     Manual reverse or forward
+// s       Stop both motors
+// r       Zero the IMUs and encoders
 // m       Print the command menu
 //
-// IMPORTANT SAFETY NOTES
-// ----------------------
-// - Test one motor at a time before testing both motors together.
-// - Confirm the motor direction signs before connecting the system to a user.
-// - Confirm that active braking is safe for the selected motor driver.
-// - Manual arrow control is open-loop, but Motor 2 is blocked at the
-//   configured elbow lower and upper limits.
-// - Motor 2 uses its encoder as the lower-limit reference. Verify that
-//   encoder counts increase while the elbow flexes upward.
-// - The 100-degree upper limit is a backup safety limit, not a target.
-// - Keep an emergency power-disconnect method available during testing.
+// Safety:
+// - Test the system without a person first.
+// - Check motor and encoder directions before automatic movement.
+// - Keep an emergency power switch close during testing.
+// - Confirm the elbow limits before using the system with a person.
 // ======================================================
 
 // ----------------------
 // Serial communication and timing
 // ----------------------
-// SERIAL_BAUD must match the Python monitor.
+// BAUD_RATE must match the Python monitor.
 // The control period is 10,000 microseconds, so the controller runs at 100 Hz.
 // Telemetry is printed every 50 milliseconds, which is 20 times per second.
 
-const unsigned long SERIAL_BAUD = 230400;
-const unsigned long CONTROL_PERIOD_US = 10000;  // 100 Hz
-const unsigned long TELEMETRY_PERIOD_MS = 50;   // 20 Hz
+const unsigned long BAUD_RATE = 230400;
+const unsigned long CTRL_US = 10000;  // 100 Hz
+const unsigned long SEND_MS = 50;   // 20 Hz
 
 // Set one of these values to true only when automatic startup is desired.
 // Keeping both false is safer because the motors wait for a user command.
-const bool AUTO_START_MOTOR_1_OSCILLATION = false;
-const bool AUTO_START_MOTOR_2_OSCILLATION = false;
+const bool AUTO_M1 = false;
+const bool AUTO_M2 = false;
 
 // ----------------------
 // IMU setup
@@ -110,7 +78,7 @@ Adafruit_BNO055 bnoForearm(1, 0x28, &Wire1);
 
 // A quaternion describes 3D orientation without the problems that can occur
 // with Euler angles. The BNO055 gives its orientation as w, x, y, and z.
-struct Quat {
+struct QuaternionData {
   float w;
   float x;
   float y;
@@ -118,44 +86,44 @@ struct Quat {
 };
 
 // Raw orientations received directly from the two IMUs.
-Quat qUpperRaw = {1.0, 0.0, 0.0, 0.0};
-Quat qForearmRaw = {1.0, 0.0, 0.0, 0.0};
+QuaternionData upRawQ = {1.0, 0.0, 0.0, 0.0};
+QuaternionData frRawQ = {1.0, 0.0, 0.0, 0.0};
 
 // Reference orientations saved when the user zeros the system.
-Quat qUpperZero = {1.0, 0.0, 0.0, 0.0};
-Quat qForearmZero = {1.0, 0.0, 0.0, 0.0};
+QuaternionData upZeroQ = {1.0, 0.0, 0.0, 0.0};
+QuaternionData frZeroQ = {1.0, 0.0, 0.0, 0.0};
 
 // Orientations measured relative to the saved zero position.
-// qJointZeroed represents the forearm orientation relative to the upper arm.
-Quat qUpperZeroed = {1.0, 0.0, 0.0, 0.0};
-Quat qForearmZeroed = {1.0, 0.0, 0.0, 0.0};
-Quat qJointZeroed = {1.0, 0.0, 0.0, 0.0};
+// elbRelQ represents the forearm orientation relative to the upper arm.
+QuaternionData upRelQ = {1.0, 0.0, 0.0, 0.0};
+QuaternionData frRelQ = {1.0, 0.0, 0.0, 0.0};
+QuaternionData elbRelQ = {1.0, 0.0, 0.0, 0.0};
 
-// imuOk prevents motor control when either IMU did not start correctly.
-bool imuOk = false;
+// imusReady prevents motor control when either IMU did not start correctly.
+bool imusReady = false;
 
 // Main angle measurements used by the controllers.
-float upperArmAngleDeg = 0.0;  // Upper arm relative to its zero position
-float rawJointAngleDeg = 0.0;  // Unfiltered elbow angle before drift correction
-float jointAngleDeg = 0.0;     // Corrected elbow angle used for control
+float upAngDeg = 0.0;  // Upper arm relative to its zero position
+float rawJntDeg = 0.0;  // Unfiltered elbow angle before drift correction
+float jntAngDeg = 0.0;     // Corrected elbow angle used for control
 
 // The BNO055 relative angle can slowly drift even when the real elbow is at
 // full extension. This offset is updated only when the Motor 2 encoder
 // confirms that the cable is at its known lower mechanical limit.
-float elbowZeroOffsetDeg = 0.0;
+float elbZeroDeg = 0.0;
 
 // BNO055 calibration values range from 0 (not calibrated) to 3 (fully
-// calibrated). They are sent to telemetry for diagnosis. They do not
+// calibrated). They are sent to live serial data for diagnosis. They do not
 // automatically stop the system in this version.
-uint8_t upperSystemCal = 0;
-uint8_t upperGyroCal = 0;
-uint8_t upperAccelCal = 0;
-uint8_t upperMagCal = 0;
+uint8_t upSysCal = 0;
+uint8_t upGyrCal = 0;
+uint8_t upAccCal = 0;
+uint8_t upMagCal = 0;
 
-uint8_t forearmSystemCal = 0;
-uint8_t forearmGyroCal = 0;
-uint8_t forearmAccelCal = 0;
-uint8_t forearmMagCal = 0;
+uint8_t frSysCal = 0;
+uint8_t frGyrCal = 0;
+uint8_t frAccCal = 0;
+uint8_t frMagCal = 0;
 
 // ----------------------
 // Elbow-angle spike filter
@@ -164,23 +132,23 @@ uint8_t forearmMagCal = 0;
 // This filter rejects large, unusual jumps and smooths normal measurements.
 // The controller uses the filtered elbow angle instead of the raw angle.
 
-float filteredJointAngleDeg = 0.0;
-float averageJointAngleDeg = 0.0;
-float jointAngleVariance = 0.0;
-float lastGoodJointAngleDeg = 0.0;
+float filtJntDeg = 0.0;
+float avgJntDeg = 0.0;
+float jntVar = 0.0;
+float lastJntDeg = 0.0;
 
-bool filterInitialized = false;
-unsigned long rejectedSpikes = 0;
+bool filtReady = false;
+unsigned long spikeCnt = 0;
 
 // Larger alpha values react faster but allow more noise.
-const float FILTER_ALPHA = 0.25;
-const float AVERAGE_ALPHA = 0.10;
-const float VARIANCE_ALPHA = 0.10;
+const float FILT_A = 0.25;
+const float AVG_A = 0.10;
+const float VAR_A = 0.10;
 
 // A reading is considered suspicious when it jumps more than 25 degrees and
 // is also much farther from the recent average than normal measurements.
-const float MAX_ANGLE_JUMP_DEG = 25.0;
-const float MIN_VARIANCE_LIMIT = 100.0;
+const float MAX_JUMP = 25.0;
+const float MIN_VAR = 100.0;
 
 // ----------------------
 // Motor hardware
@@ -209,10 +177,10 @@ const int REVERSE = -1;
 // Change only one sign at a time during testing.
 // - Motor sign: change to -1 when the motor turns opposite to the command.
 // - Encoder sign: change to -1 when encoder counts have the wrong sign.
-const int M1_MOTOR_DIRECTION_SIGN = 1;
-const int M2_MOTOR_DIRECTION_SIGN = 1;
-const int M1_ENCODER_SIGN = 1;
-const int M2_ENCODER_SIGN = 1;
+const int M1_DIR = 1;
+const int M2_DIR = 1;
+const int M1_ENCSGN = 1;
+const int M2_ENCSGN = 1;
 
 // Manual arrow-key speed. This is the raw PWM used while an arrow command is
 // active. Lower this value when slower manual positioning is needed.
@@ -227,63 +195,63 @@ const int MANUAL_PWM = 125;
 // After zeroImus() is called at full extension, Motor 2 encoder counts should
 // move away from zero as the elbow flexes and return near zero at extension.
 // The lower-limit check below uses the absolute distance from zero, so it works
-// whether flexion produces positive or negative counts. M2_ENCODER_SIGN still
-// controls the sign shown in telemetry and is important if the optional encoder
+// whether flexion produces positive or negative counts. M2_ENCSGN still
+// controls the sign shown in the monitor. It is also important if the optional encoder
 // upper limit is enabled later.
 //
 // The lower limit uses encoder counts because the encoder does not experience
 // the same orientation drift as the IMUs. The upper limit uses the corrected
 // elbow angle and can optionally also use an encoder count after calibration.
 
-const float ELBOW_MIN_PHYSICAL_DEG = 0.0;
-const float ELBOW_MAX_SAFE_DEG = 100.0;
-const float ELBOW_UPPER_LIMIT_RELEASE_DEG = 98.0;
+const float ELB_MIN = 0.0;
+const float ELB_MAX = 100.0;
+const float ELB_REL = 98.0;
 
 // At full extension, encoder2 is set to zero.
-// Enter and release margins add hysteresis and prevent limit chatter.
-const long M2_LOWER_LIMIT_COUNTS = 0;
-const long M2_LOWER_LIMIT_ENTER_MARGIN_COUNTS = 100;
-const long M2_LOWER_LIMIT_RELEASE_MARGIN_COUNTS = 300;
+// The enter and release margins stop the limit from turning on and off quickly.
+const long M2_LOW = 0;
+const long M2_LOW_IN = 100;
+const long M2_LOW_OUT = 300;
 
 // Optional encoder-based upper limit.
-// Leave false until M2_UPPER_LIMIT_COUNTS has been measured safely.
-const bool USE_M2_ENCODER_UPPER_LIMIT = false;
-const long M2_UPPER_LIMIT_COUNTS = 90000;
-const long M2_UPPER_LIMIT_RELEASE_COUNTS = 89000;
+// Leave false until M2_UP has been measured safely.
+const bool USE_M2_UP = false;
+const long M2_UP = 90000;
+const long M2_UP_REL = 89000;
 
 // Automatic elbow-only zero correction.
 // The encoder must remain at the lower limit while the elbow is nearly still.
 // This corrects IMU drift without changing Motor 1's IMU reference.
-const bool ENABLE_ELBOW_AUTO_ZERO = true;
-const unsigned long LOWER_LIMIT_CONFIRM_MS = 400;
-const unsigned long MIN_ZERO_CORRECTION_INTERVAL_MS = 2000;
-const float LOWER_LIMIT_MAX_MEASURED_VELOCITY_DEG_S = 1.0;
-const float MIN_ELBOW_ZERO_CORRECTION_DEG = 0.50;
+const bool AUTO_ZERO = true;
+const unsigned long LOW_HOLDMS = 400;
+const unsigned long ZERO_WAIT = 2000;
+const float LOW_VEL = 1.0;
+const float MIN_ZERO = 0.50;
 
 // Runtime safety state.
-bool motor2LowerLimitActive = false;
-bool motor2UpperLimitActive = false;
-unsigned long lowerLimitStillStartMs = 0;
-unsigned long lastElbowZeroCorrectionMs = 0;
-unsigned long elbowZeroCorrectionCount = 0;
+bool m2LowOn = false;
+bool m2UpOn = false;
+unsigned long lowStartMs = 0;
+unsigned long lastZeroMs = 0;
+unsigned long zeroCnt = 0;
 
 // ----------------------
 // Feedback selection
 // ----------------------
 // Feedback is the angle that a motor tries to control.
-// FEEDBACK_UPPER_ARM uses only the upper IMU.
-// FEEDBACK_ELBOW_JOINT uses the relative angle between both IMUs.
+// FB_UPPER uses only the upper IMU.
+// FB_ELBOW uses the relative angle between both IMUs.
 
 enum FeedbackSource {
-  FEEDBACK_UPPER_ARM,
-  FEEDBACK_ELBOW_JOINT
+  FB_UPPER,
+  FB_ELBOW
 };
 
 // Current final-product assignment:
 // Motor 1 controls the upper-arm angle.
 // Motor 2 controls the elbow-joint angle.
-const FeedbackSource MOTOR_1_FEEDBACK = FEEDBACK_UPPER_ARM;
-const FeedbackSource MOTOR_2_FEEDBACK = FEEDBACK_ELBOW_JOINT;
+const FeedbackSource M1_FB = FB_UPPER;
+const FeedbackSource M2_FB = FB_ELBOW;
 
 // ----------------------
 // Motor controller settings and runtime state
@@ -296,77 +264,110 @@ struct MotorController {
   const char* name;
 
   // Hardware connections and direction corrections
-  int in1;
-  int in2;
+  int inputPin1;
+  int inputPin2;
   Encoder* encoder;
-  int encoderSign;
-  int motorDirectionSign;
-  FeedbackSource feedbackSource;
+  int encSign;
+  int motSign;
+  FeedbackSource fbSrc;
 
-  // PID gains
-  // kp reacts to the current position error.
-  // ki reacts to error that continues over time.
-  // kd reacts to velocity error: desired velocity minus measured velocity.
-  // uFull is the controller-output value treated as full effort.
-  float kp;
-  float ki;
-  float kd;
+  // Control gains
+  // kpPos reacts to the current position error.
+  // kiInt reacts to error that continues over time.
+  // kvVel multiplies desired-minus-measured velocity only while the
+  // oscillation trajectory is running. Fixed-target control remains PI.
+  // velLim protects the motor from a bad IMU velocity spike.
+  // The effort deadband and direction threshold stop fast direction changes
+  // when the control output is close to zero.
+  // uFull is the signed controller-output magnitude treated as full effort.
+  float kpPos;
+  float kiInt;
+  float kvVel;
+  float velLim;
+  float oscDead;
+  float dirThres;
   float uFull;
 
   // PWM limits
-  // minPwm helps overcome the motor deadband.
-  // maxPwm is the largest command allowed.
-  // slowPwm limits speed when the motor is near a fixed target.
-  int minPwm;
-  int maxPwm;
-  int slowPwm;
+  // minimumPwm helps overcome the motor deadband.
+  // maximumPwm is the largest command allowed.
+  // nearPwm limits speed when the motor is near a fixed target.
+  int minimumPwm;
+  int maximumPwm;
+  int nearPwm;
 
   // Fixed-target behavior and safety
-  float toleranceDeg;
-  float slowZoneDeg;
-  unsigned long fixedTargetTimeoutMs;
+  float tgtTolDeg;
+  float nearDeg;
+  unsigned long tgtToutMs;
 
   // Values saved between PID updates
-  float targetDeg;
-  float previousError;
-  float integralError;
-  float previousMeasurement;
-  float previousOutput;
+  float tgtAngDeg;
+  float prevErrDeg;
+  float intErr;
+  float prevAngDeg;
+  float prevOut;
 
   // Velocity tracking values in degrees per second.
-  // During oscillation, desiredVelocityDegPerSec comes from the exact
-  // derivative of the oscillation function. measuredVelocityDegPerSec is
+  // During oscillation, desVel comes from the exact
+  // derivative of the oscillation function. measVel is
   // calculated from the IMU angle and filtered to reduce noise.
-  float desiredVelocityDegPerSec;
-  float measuredVelocityDegPerSec;
+  float desVel;
+  float measVel;
 
-  // Most recent motor command, also used for telemetry
-  float normalizedEffort;
-  int pwm;
-  float signedPwmCommand;
+  // Most recent motor command, also shown in the monitor
+  float normEff;
+  int pwmCommand;
+  float pwmCmd;
 
   // Operating state
-  bool active;
-  bool holding;
-  bool oscillationEnabled;
+  bool ctrlOn;
+  bool brakeHold;
+  bool oscOn;
 
   // Manual mode bypasses PID and directly drives the motor at MANUAL_PWM.
-  bool manualEnabled;
-  int manualDirection;
+  bool manOn;
+  int manDir;
 
-  unsigned long targetStartMs;
-  unsigned long oscillationStartMs;
+  unsigned long tgtStartMs;
+  unsigned long oscStartMs;
+
+  // Oscillation startup state. The motor first moves to the lower endpoint,
+  // settles there, and only then starts the time-varying cosine trajectory.
+  bool oscPrep;
+  unsigned long oscReadyMs;
+
+  // Extra Motor 2 values sent to the Python monitor.
+  float pTerm;
+  float iTerm;
+  float rawVTerm;
+  float vTerm;
+  bool velLimOn;
+  bool dirProtOn;
+  int oscDir;
+  float rawOut;
+  float satOut;
+  int satState;  // -1 low, 0 none, +1 high
+  int pwmLim;
+  bool nearOn;
+  bool brakeOn;
+  bool settled;
+  bool longGap;
+  float ctrlDt;
+  float intDt;
+  unsigned long setStartMs;
 };
 
 // Motor 1 tuning and limits.
-// kd is now used as the velocity-tracking gain. The starting value is small
-// and should be tuned carefully on the real mechanism.
+// kvVel is used only during oscillation; fixed targets use PI control.
 MotorController motor1 = {
   "M1",
   M1_IN1, M1_IN2, &encoder1,
-  M1_ENCODER_SIGN, M1_MOTOR_DIRECTION_SIGN, MOTOR_1_FEEDBACK,
+  M1_ENCSGN, M1_DIR, M1_FB,
 
-  0.90, 0.05, 0.10, 20.0,
+  // Motor 1 retains its previous behavior. A zero velocity-term limit means
+  // no limit, and zero thresholds turn off the new direction protection.
+  0.90, 0.05, 0.10, 0.0, 0.0, 0.0, 20.0,
   150, 255, 150,
   1.0, 5.0, 15000,
 
@@ -377,15 +378,18 @@ MotorController motor1 = {
 };
 
 // Motor 2 tuning and limits.
-// kd is now used as the velocity-tracking gain. The starting value is small
-// and should be tuned carefully on the real mechanism.
+// Fixed-target gains: Kp=0.75, Ki=0.055. Oscillation additionally uses
+// Kv=0.05 on desired-minus-measured angular velocity.
 MotorController motor2 = {
   "M2",
   M2_IN1, M2_IN2, &encoder2,
-  M2_ENCODER_SIGN, M2_MOTOR_DIRECTION_SIGN, MOTOR_2_FEEDBACK,
+  M2_ENCSGN, M2_DIR, M2_FB,
 
-  0.75, 0.055, 0.0, 20.0,
-  105, 255, 150,
+  // Clamp the oscillation velocity contribution to +/-1.5 controller units.
+  // Around zero effort, coast below 0.20 and require at least 0.75 before
+  // changing the saved motor direction.
+  0.75, 0.055, 0.05, 1.50, 0.20, 0.75, 20.0,
+  100, 255, 130,
   1.0, 5.0, 15000,
 
   0.0, 0.0, 0.0, 0.0, 0.0,
@@ -395,18 +399,18 @@ MotorController motor2 = {
 };
 
 // Existing target mapping is preserved: key 0 means 5 degrees.
-const float PRESET_TARGETS_DEG[10] = {
+const float TGT_LIST[10] = {
   5.0, 10.0, 20.0, 30.0, 40.0,
   50.0, 60.0, 70.0, 80.0, 90.0
 };
 
 // Target, oscillation, and manual arrow commands affect the selected motor.
 // Motor 2 is selected when the program starts.
-MotorController* selectedMotor = &motor2;
+MotorController* selMotor = &motor2;
 
 // ANSI arrow keys arrive as three serial bytes: ESC, [, and C or D.
 // This variable remembers which part of that sequence was received.
-int serialEscapeState = 0;
+int keyState = 0;
 
 // ----------------------
 // Oscillation settings
@@ -415,24 +419,38 @@ int serialEscapeState = 0;
 // it moves from 10 to 80 degrees and back. At 0.05 Hz, one complete cycle
 // takes 20 seconds.
 
-const float OSCILLATION_FREQUENCY_HZ = 0.05;
-const float OSCILLATION_CENTER_DEG = 45.0;
-const float OSCILLATION_AMPLITUDE_DEG = 35.0;
+const float OSC_HZ = 0.05;
+const float OSC_CTR = 45.0;
+const float OSC_AMP = 35.0;
 
 // The measured angular velocity is calculated by differentiating the IMU
 // angle. Differentiation can amplify sensor noise, so this low-pass filter is
 // applied before velocity error is used by the controller. A smaller value is
 // smoother; a larger value reacts faster.
-const float VELOCITY_FILTER_ALPHA = 0.20;
+const float VEL_FILT = 0.20;
+
+// Timing and safety settings.
+// Actual dt is preserved for velocity estimation. Integration is skipped after
+// a long gap so a delayed loop cannot create a large integral jump.
+const float MAX_INT_DT = 0.05;
+const float GAP_SEC = 0.05;
+
+// A fixed target is reported as settled only after the brake state remains
+// inside the target band with low measured velocity for this confirmation time.
+const float SET_VEL = 2.0;
+const unsigned long SET_MS = 200;
+
+// Oscillation begins only after the lower endpoint has settled.
+const unsigned long PREP_MS = 300;
 
 // ----------------------
 // Runtime timing
 // ----------------------
-// These variables remember when control and telemetry last ran.
+// These variables remember when control and serial printing last ran.
 // unsigned long arithmetic also handles the normal micros()/millis() rollover.
 
-unsigned long lastControlUs = 0;
-unsigned long lastTelemetryMs = 0;
+unsigned long lastCtrlUs = 0;
+unsigned long lastSendMs = 0;
 
 // ======================================================
 // Function declarations
@@ -440,13 +458,13 @@ unsigned long lastTelemetryMs = 0;
 // These declarations tell the compiler which functions are defined later.
 // They also provide a quick list of the program's main tasks.
 
-Quat normalizeQuaternion(Quat q);
-Quat conjugateQuaternion(Quat q);
-Quat multiplyQuaternions(Quat a, Quat b);
-Quat fromBnoQuaternion(imu::Quaternion q);
-float quaternionAngleDeg(Quat q);
+QuaternionData normalizeQuaternion(QuaternionData q);
+QuaternionData conjugateQuaternion(QuaternionData q);
+QuaternionData multiplyQuaternions(QuaternionData a, QuaternionData b);
+QuaternionData fromBnoQuaternion(imu::Quaternion q);
+float quaternionAngleDeg(QuaternionData q);
 
-void resetJointAngleFilter(float startAngleDeg);
+void resetJointAngleFilter(float startDeg);
 float filterJointAngle(float rawDeg);
 
 bool startImus();
@@ -454,9 +472,9 @@ void readImus();
 void zeroImus();
 void readImuCalibrationStatus();
 
-float feedbackAngle(const MotorController& motor);
-const char* feedbackName(const MotorController& motor);
-long encoderCounts(const MotorController& motor);
+float getFeedbackAngle(const MotorController& motor);
+const char* getFeedbackName(const MotorController& motor);
+long getEncoderCounts(const MotorController& motor);
 
 bool isMotor2(const MotorController& motor);
 bool readMotor2LowerLimit();
@@ -469,22 +487,27 @@ void clearMotorCommandAtLimit(MotorController& motor);
 void correctElbowZeroAtLowerLimit();
 void updateElbowSafetyState();
 
-void driveMotor(MotorController& motor, int direction, int pwm);
+void driveMotor(MotorController& motor, int direction, int pwmCommand);
 void motorOff(MotorController& motor);
 void motorHold(MotorController& motor);
 
 float clamp01(float value);
 void resetControllerState(MotorController& motor, bool deactivate);
-void initializeControllerForTarget(MotorController& motor, float targetDeg);
-void updatePid(MotorController& motor, float dtSeconds);
+void initializeControllerForTarget(MotorController& motor, float tgtAngDeg);
+void updateMotorController(
+    MotorController& motor,
+    float ctrlDt,
+    float intDt,
+    bool longGap
+);
 
-float calculateOscillationTarget(float timeSeconds);
-float calculateOscillationVelocity(float timeSeconds);
+float calculateOscillationTargetAngle(float timeSec);
+float calculateOscillationVelocity(float timeSec);
 void startOscillation(MotorController& motor);
 void stopOscillation(MotorController& motor);
 void updateOscillationTarget(MotorController& motor);
 
-void setFixedTarget(MotorController& motor, float targetDeg);
+void setFixedTarget(MotorController& motor, float tgtAngDeg);
 void startManualDrive(MotorController& motor, int direction);
 void updateManualDrive(MotorController& motor);
 void stopMotor(MotorController& motor, const char* reason);
@@ -494,8 +517,8 @@ void checkSerialCommands();
 void handleSerialCommand(char command);
 void handleArrowCommand(char arrowCode);
 
-const char* controlModeName(const MotorController& motor);
-void printQuaternion(const char* label, Quat q);
+const char* getControlModeName(const MotorController& motor);
+void printQuaternion(const char* label, QuaternionData q);
 void printTelemetry();
 void printMenu();
 
@@ -505,7 +528,7 @@ void printMenu();
 
 // Makes a quaternion have a length of 1.
 // Normalization is required before using it for orientation calculations.
-Quat normalizeQuaternion(Quat q) {
+QuaternionData normalizeQuaternion(QuaternionData q) {
   float magnitude = sqrt(
       q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
 
@@ -522,14 +545,14 @@ Quat normalizeQuaternion(Quat q) {
 
 // Returns the inverse rotation for a normalized quaternion.
 // It is used to compare a new orientation with the saved zero orientation.
-Quat conjugateQuaternion(Quat q) {
+QuaternionData conjugateQuaternion(QuaternionData q) {
   q = normalizeQuaternion(q);
   return {q.w, -q.x, -q.y, -q.z};
 }
 
 // Combines two rotations. Quaternion multiplication order is important.
-Quat multiplyQuaternions(Quat a, Quat b) {
-  Quat result;
+QuaternionData multiplyQuaternions(QuaternionData a, QuaternionData b) {
+  QuaternionData result;
 
   result.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
   result.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
@@ -539,8 +562,8 @@ Quat multiplyQuaternions(Quat a, Quat b) {
   return normalizeQuaternion(result);
 }
 
-// Converts the Adafruit library quaternion into the program's Quat type.
-Quat fromBnoQuaternion(imu::Quaternion q) {
+// Converts the Adafruit library quaternion into the program's QuaternionData type.
+QuaternionData fromBnoQuaternion(imu::Quaternion q) {
   return normalizeQuaternion({
     (float)q.w(),
     (float)q.x(),
@@ -551,7 +574,7 @@ Quat fromBnoQuaternion(imu::Quaternion q) {
 
 // Converts a quaternion rotation into one positive angle in degrees.
 // This gives the size of the rotation, not a signed rotation direction.
-float quaternionAngleDeg(Quat q) {
+float quaternionAngleDeg(QuaternionData q) {
   q = normalizeQuaternion(q);
   float w = constrain(fabsf(q.w), 0.0f, 1.0f);
   return 2.0 * acos(w) * 180.0 / PI;
@@ -562,61 +585,61 @@ float quaternionAngleDeg(Quat q) {
 // ======================================================
 
 // Starts or restarts the elbow filter at a known angle.
-void resetJointAngleFilter(float startAngleDeg) {
-  rawJointAngleDeg = startAngleDeg;
-  filteredJointAngleDeg = startAngleDeg;
-  averageJointAngleDeg = startAngleDeg;
-  jointAngleVariance = 0.0;
-  lastGoodJointAngleDeg = startAngleDeg;
-  filterInitialized = true;
-  rejectedSpikes = 0;
+void resetJointAngleFilter(float startDeg) {
+  rawJntDeg = startDeg;
+  filtJntDeg = startDeg;
+  avgJntDeg = startDeg;
+  jntVar = 0.0;
+  lastJntDeg = startDeg;
+  filtReady = true;
+  spikeCnt = 0;
 }
 
 // Checks a new elbow reading for a spike and then applies smoothing.
 // A rejected spike is replaced with the last trusted filtered value.
 float filterJointAngle(float rawDeg) {
-  if (!filterInitialized) {
+  if (!filtReady) {
     resetJointAngleFilter(rawDeg);
     return rawDeg;
   }
 
-  float jump = fabs(rawDeg - filteredJointAngleDeg);
-  float differenceFromAverage = rawDeg - averageJointAngleDeg;
-  float instantaneousVariance =
-      differenceFromAverage * differenceFromAverage;
+  float jump = fabs(rawDeg - filtJntDeg);
+  float avgDiff = rawDeg - avgJntDeg;
+  float instVar =
+      avgDiff * avgDiff;
 
-  float varianceLimit = max(
-      jointAngleVariance * 3.0f,
-      MIN_VARIANCE_LIMIT
+  float varLim = max(
+      jntVar * 3.0f,
+      MIN_VAR
   );
 
   bool isSpike =
-      (jump > MAX_ANGLE_JUMP_DEG) &&
-      (instantaneousVariance > varianceLimit);
+      (jump > MAX_JUMP) &&
+      (instVar > varLim);
 
   if (isSpike) {
-    rejectedSpikes++;
-    filteredJointAngleDeg = lastGoodJointAngleDeg;
-    return filteredJointAngleDeg;
+    spikeCnt++;
+    filtJntDeg = lastJntDeg;
+    return filtJntDeg;
   }
 
-  averageJointAngleDeg =
-      AVERAGE_ALPHA * rawDeg +
-      (1.0 - AVERAGE_ALPHA) * averageJointAngleDeg;
+  avgJntDeg =
+      AVG_A * rawDeg +
+      (1.0 - AVG_A) * avgJntDeg;
 
-  float newDifference = rawDeg - averageJointAngleDeg;
-  float newVariance = newDifference * newDifference;
+  float newDiff = rawDeg - avgJntDeg;
+  float newVar = newDiff * newDiff;
 
-  jointAngleVariance =
-      VARIANCE_ALPHA * newVariance +
-      (1.0 - VARIANCE_ALPHA) * jointAngleVariance;
+  jntVar =
+      VAR_A * newVar +
+      (1.0 - VAR_A) * jntVar;
 
-  filteredJointAngleDeg =
-      FILTER_ALPHA * rawDeg +
-      (1.0 - FILTER_ALPHA) * filteredJointAngleDeg;
+  filtJntDeg =
+      FILT_A * rawDeg +
+      (1.0 - FILT_A) * filtJntDeg;
 
-  lastGoodJointAngleDeg = filteredJointAngleDeg;
-  return filteredJointAngleDeg;
+  lastJntDeg = filtJntDeg;
+  return filtJntDeg;
 }
 
 // ======================================================
@@ -642,7 +665,7 @@ bool startImus() {
   }
 
   if (!upperOk || !forearmOk) {
-    imuOk = false;
+    imusReady = false;
     return false;
   }
 
@@ -650,7 +673,7 @@ bool startImus() {
   bnoUpper.setExtCrystalUse(true);
   bnoForearm.setExtCrystalUse(true);
 
-  imuOk = true;
+  imusReady = true;
   readImus();
   zeroImus();
 
@@ -662,110 +685,110 @@ bool startImus() {
 // The elbow angle is found from forearm orientation relative to upper-arm
 // orientation. This removes motion that both arm sections share.
 void readImus() {
-  if (!imuOk) {
+  if (!imusReady) {
     return;
   }
 
-  qUpperRaw = fromBnoQuaternion(bnoUpper.getQuat());
-  qForearmRaw = fromBnoQuaternion(bnoForearm.getQuat());
+  upRawQ = fromBnoQuaternion(bnoUpper.getQuat());
+  frRawQ = fromBnoQuaternion(bnoForearm.getQuat());
 
-  qUpperZeroed = multiplyQuaternions(
-      conjugateQuaternion(qUpperZero), qUpperRaw);
+  upRelQ = multiplyQuaternions(
+      conjugateQuaternion(upZeroQ), upRawQ);
 
-  qForearmZeroed = multiplyQuaternions(
-      conjugateQuaternion(qForearmZero), qForearmRaw);
+  frRelQ = multiplyQuaternions(
+      conjugateQuaternion(frZeroQ), frRawQ);
 
-  qJointZeroed = multiplyQuaternions(
-      conjugateQuaternion(qUpperZeroed), qForearmZeroed);
+  elbRelQ = multiplyQuaternions(
+      conjugateQuaternion(upRelQ), frRelQ);
 
-  upperArmAngleDeg = quaternionAngleDeg(qUpperZeroed);
-  rawJointAngleDeg = quaternionAngleDeg(qJointZeroed);
+  upAngDeg = quaternionAngleDeg(upRelQ);
+  rawJntDeg = quaternionAngleDeg(elbRelQ);
 
   // First filter the uncorrected relative IMU angle. Then subtract the
   // encoder-confirmed drift offset. This keeps filtering and drift correction
   // as two separate operations.
-  float filteredUncorrectedJointDeg =
-      filterJointAngle(rawJointAngleDeg);
+  float filtRawDeg =
+      filterJointAngle(rawJntDeg);
 
-  jointAngleDeg =
-      filteredUncorrectedJointDeg - elbowZeroOffsetDeg;
+  jntAngDeg =
+      filtRawDeg - elbZeroDeg;
 
   // The elbow cannot physically extend below zero. Only clamp small negative
   // values caused by normal filter noise; larger negative values remain
   // visible so a bad offset can be diagnosed.
-  if (jointAngleDeg < 0.0 && jointAngleDeg > -2.0) {
-    jointAngleDeg = 0.0;
+  if (jntAngDeg < 0.0 && jntAngDeg > -2.0) {
+    jntAngDeg = 0.0;
   }
 }
 
-// Reads BNO055 calibration status for telemetry.
+// Reads the BNO055 calibration values for the Python monitor.
 // Each value ranges from 0 to 3.
 void readImuCalibrationStatus() {
-  if (!imuOk) {
-    upperSystemCal = 0;
-    upperGyroCal = 0;
-    upperAccelCal = 0;
-    upperMagCal = 0;
+  if (!imusReady) {
+    upSysCal = 0;
+    upGyrCal = 0;
+    upAccCal = 0;
+    upMagCal = 0;
 
-    forearmSystemCal = 0;
-    forearmGyroCal = 0;
-    forearmAccelCal = 0;
-    forearmMagCal = 0;
+    frSysCal = 0;
+    frGyrCal = 0;
+    frAccCal = 0;
+    frMagCal = 0;
     return;
   }
 
   bnoUpper.getCalibration(
-      &upperSystemCal,
-      &upperGyroCal,
-      &upperAccelCal,
-      &upperMagCal
+      &upSysCal,
+      &upGyrCal,
+      &upAccCal,
+      &upMagCal
   );
 
   bnoForearm.getCalibration(
-      &forearmSystemCal,
-      &forearmGyroCal,
-      &forearmAccelCal,
-      &forearmMagCal
+      &frSysCal,
+      &frGyrCal,
+      &frAccCal,
+      &frMagCal
   );
 }
 
 // Saves the current arm position as zero and clears the encoders.
 // All motor motion is stopped first so the reference is taken safely.
 void zeroImus() {
-  if (!imuOk) {
+  if (!imusReady) {
     Serial.println("Cannot zero IMUs: IMUs are not ready.");
     return;
   }
 
   stopAllMotion("imu_zero");
 
-  qUpperRaw = fromBnoQuaternion(bnoUpper.getQuat());
-  qForearmRaw = fromBnoQuaternion(bnoForearm.getQuat());
+  upRawQ = fromBnoQuaternion(bnoUpper.getQuat());
+  frRawQ = fromBnoQuaternion(bnoForearm.getQuat());
 
-  qUpperZero = qUpperRaw;
-  qForearmZero = qForearmRaw;
+  upZeroQ = upRawQ;
+  frZeroQ = frRawQ;
 
-  qUpperZeroed = {1.0, 0.0, 0.0, 0.0};
-  qForearmZeroed = {1.0, 0.0, 0.0, 0.0};
-  qJointZeroed = {1.0, 0.0, 0.0, 0.0};
+  upRelQ = {1.0, 0.0, 0.0, 0.0};
+  frRelQ = {1.0, 0.0, 0.0, 0.0};
+  elbRelQ = {1.0, 0.0, 0.0, 0.0};
 
-  upperArmAngleDeg = 0.0;
-  rawJointAngleDeg = 0.0;
-  jointAngleDeg = 0.0;
-  elbowZeroOffsetDeg = 0.0;
+  upAngDeg = 0.0;
+  rawJntDeg = 0.0;
+  jntAngDeg = 0.0;
+  elbZeroDeg = 0.0;
   resetJointAngleFilter(0.0);
 
   encoder1.write(0);
   encoder2.write(0);
 
-  motor2LowerLimitActive = true;
-  motor2UpperLimitActive = false;
-  lowerLimitStillStartMs = 0;
-  lastElbowZeroCorrectionMs = millis();
-  elbowZeroCorrectionCount = 0;
+  m2LowOn = true;
+  m2UpOn = false;
+  lowStartMs = 0;
+  lastZeroMs = millis();
+  zeroCnt = 0;
 
-  motor1.targetDeg = 0.0;
-  motor2.targetDeg = 0.0;
+  motor1.tgtAngDeg = 0.0;
+  motor2.tgtAngDeg = 0.0;
 
   Serial.println("IMUs and encoders zeroed.");
 }
@@ -775,17 +798,17 @@ void zeroImus() {
 // ======================================================
 
 // Returns the angle selected for this motor's feedback source.
-float feedbackAngle(const MotorController& motor) {
-  if (motor.feedbackSource == FEEDBACK_UPPER_ARM) {
-    return upperArmAngleDeg;
+float getFeedbackAngle(const MotorController& motor) {
+  if (motor.fbSrc == FB_UPPER) {
+    return upAngDeg;
   }
 
-  return jointAngleDeg;
+  return jntAngDeg;
 }
 
 // Returns a readable feedback name for status messages.
-const char* feedbackName(const MotorController& motor) {
-  if (motor.feedbackSource == FEEDBACK_UPPER_ARM) {
+const char* getFeedbackName(const MotorController& motor) {
+  if (motor.fbSrc == FB_UPPER) {
     return "UpperArm";
   }
 
@@ -794,9 +817,9 @@ const char* feedbackName(const MotorController& motor) {
 
 // Reads the motor encoder and applies its configured sign correction.
 // The PID currently uses IMU angle feedback; encoder counts are sent as
-// telemetry and remain available for future speed or position control.
-long encoderCounts(const MotorController& motor) {
-  return motor.encoderSign * motor.encoder->read();
+// the monitor. They can also be used for future speed or position control.
+long getEncoderCounts(const MotorController& motor) {
+  return motor.encSign * motor.encoder->read();
 }
 
 // Returns true only for the controller connected to the elbow cable motor.
@@ -804,55 +827,55 @@ bool isMotor2(const MotorController& motor) {
   return &motor == &motor2;
 }
 
-// Reads the encoder-based lower limit with hysteresis.
+// Reads the encoder-based lower limit with a small release margin.
 // Full extension is a small WINDOW around the saved zero count. Using the
 // absolute distance from zero is important: the old <= comparison treated
 // every negative encoder value as being at the lower limit, which could block
 // reverse/down movement during the entire range of motion when the encoder
 // direction was negative.
 bool readMotor2LowerLimit() {
-  long currentCounts = encoderCounts(motor2);
-  long distanceFromLowerLimit = labs(
-      currentCounts - M2_LOWER_LIMIT_COUNTS
+  long curCnt = getEncoderCounts(motor2);
+  long lowDist = labs(
+      curCnt - M2_LOW
   );
 
-  if (motor2LowerLimitActive) {
-    return distanceFromLowerLimit <=
-        M2_LOWER_LIMIT_RELEASE_MARGIN_COUNTS;
+  if (m2LowOn) {
+    return lowDist <=
+        M2_LOW_OUT;
   }
 
-  return distanceFromLowerLimit <=
-      M2_LOWER_LIMIT_ENTER_MARGIN_COUNTS;
+  return lowDist <=
+      M2_LOW_IN;
 }
 
-// Reads the upper elbow safety limit with hysteresis.
+// Reads the upper elbow safety limit with a small release margin.
 // The IMU angle limit is always enabled. The encoder upper limit is optional.
 bool readMotor2UpperLimit() {
   bool angleLimit;
 
-  if (motor2UpperLimitActive) {
+  if (m2UpOn) {
     angleLimit =
-        jointAngleDeg >= ELBOW_UPPER_LIMIT_RELEASE_DEG;
+        jntAngDeg >= ELB_REL;
   } else {
     angleLimit =
-        jointAngleDeg >= ELBOW_MAX_SAFE_DEG;
+        jntAngDeg >= ELB_MAX;
   }
 
-  bool encoderLimit = false;
+  bool encLim = false;
 
-  if (USE_M2_ENCODER_UPPER_LIMIT) {
-    long currentCounts = encoderCounts(motor2);
+  if (USE_M2_UP) {
+    long curCnt = getEncoderCounts(motor2);
 
-    if (motor2UpperLimitActive) {
-      encoderLimit =
-          currentCounts >= M2_UPPER_LIMIT_RELEASE_COUNTS;
+    if (m2UpOn) {
+      encLim =
+          curCnt >= M2_UP_REL;
     } else {
-      encoderLimit =
-          currentCounts >= M2_UPPER_LIMIT_COUNTS;
+      encLim =
+          curCnt >= M2_UP;
     }
   }
 
-  return angleLimit || encoderLimit;
+  return angleLimit || encLim;
 }
 
 // Blocks only the unsafe direction.
@@ -866,11 +889,11 @@ bool motorDirectionBlockedByElbowSafety(
     return false;
   }
 
-  if (direction == REVERSE && motor2LowerLimitActive) {
+  if (direction == REVERSE && m2LowOn) {
     return true;
   }
 
-  if (direction == FORWARD && motor2UpperLimitActive) {
+  if (direction == FORWARD && m2UpOn) {
     return true;
   }
 
@@ -878,168 +901,181 @@ bool motorDirectionBlockedByElbowSafety(
 }
 
 // Clears motor output and all stored control effort when a mechanical limit
-// blocks motion. The active trajectory is preserved, so the controller can
+// blocks motion. The current target is kept, so the controller can
 // move safely away from the limit when the target changes direction.
 void clearMotorCommandAtLimit(MotorController& motor) {
   motorOff(motor);
 
-  float current = feedbackAngle(motor);
+  float current = getFeedbackAngle(motor);
 
-  motor.integralError = 0.0;
-  motor.previousOutput = 0.0;
-  motor.previousMeasurement = current;
-  motor.previousError = motor.targetDeg - current;
-  motor.measuredVelocityDegPerSec = 0.0;
+  motor.intErr = 0.0;
+  motor.prevOut = 0.0;
+  motor.prevAngDeg = current;
+  motor.prevErrDeg = motor.tgtAngDeg - current;
+  motor.measVel = 0.0;
 
-  motor.normalizedEffort = 0.0;
-  motor.pwm = 0;
-  motor.signedPwmCommand = 0.0;
-  motor.holding = false;
+  motor.normEff = 0.0;
+  motor.pwmCommand = 0;
+  motor.pwmCmd = 0.0;
+  motor.brakeHold = false;
+  motor.brakeOn = false;
+  motor.settled = false;
+  motor.setStartMs = 0;
+  motor.pTerm = 0.0;
+  motor.iTerm = 0.0;
+  motor.rawVTerm = 0.0;
+  motor.vTerm = 0.0;
+  motor.velLimOn = false;
+  motor.dirProtOn = false;
+  motor.oscDir = 0;
+  motor.rawOut = 0.0;
+  motor.satOut = 0.0;
+  motor.satState = 0;
 }
 
 // Corrects only the elbow feedback zero.
 // It does not replace the upper-arm or forearm quaternion zero references and
 // does not stop Motor 1.
 void correctElbowZeroAtLowerLimit() {
-  float oldCorrectedAngleDeg = jointAngleDeg;
+  float oldAngDeg = jntAngDeg;
 
   // Avoid repeated corrections for very small normal noise.
-  if (fabs(oldCorrectedAngleDeg) <
-      MIN_ELBOW_ZERO_CORRECTION_DEG) {
+  if (fabs(oldAngDeg) <
+      MIN_ZERO) {
     return;
   }
 
   motorOff(motor2);
 
-  // filteredJointAngleDeg is the filtered angle before offset subtraction.
+  // filtJntDeg is the filtered angle before offset subtraction.
   // Saving it as the offset makes the corrected elbow angle equal to zero.
-  elbowZeroOffsetDeg = filteredJointAngleDeg;
-  jointAngleDeg = ELBOW_MIN_PHYSICAL_DEG;
+  elbZeroDeg = filtJntDeg;
+  jntAngDeg = ELB_MIN;
 
   // Re-anchor the encoder at the known mechanical lower limit.
   encoder2.write(0);
 
   // A manual reverse command must not continue against the limit.
-  if (motor2.manualEnabled &&
-      motor2.manualDirection == REVERSE) {
-    motor2.manualEnabled = false;
-    motor2.manualDirection = 0;
+  if (motor2.manOn &&
+      motor2.manDir == REVERSE) {
+    motor2.manOn = false;
+    motor2.manDir = 0;
   }
 
   clearMotorCommandAtLimit(motor2);
 
-  lastElbowZeroCorrectionMs = millis();
-  elbowZeroCorrectionCount++;
+  lastZeroMs = millis();
+  zeroCnt++;
 
   Serial.print("ELBOW_ZERO_CORRECTED,");
-  Serial.print(lastElbowZeroCorrectionMs);
+  Serial.print(lastZeroMs);
   Serial.print(",");
-  Serial.print(oldCorrectedAngleDeg, 4);
+  Serial.print(oldAngDeg, 4);
   Serial.print(",");
-  Serial.print(elbowZeroOffsetDeg, 4);
+  Serial.print(elbZeroDeg, 4);
   Serial.print(",");
-  Serial.println(elbowZeroCorrectionCount);
+  Serial.println(zeroCnt);
 }
 
 // Updates lower/upper limit states and performs confirmed elbow drift
 // correction while the mechanism is resting at full extension.
 void updateElbowSafetyState() {
-  bool previousLower = motor2LowerLimitActive;
-  bool previousUpper = motor2UpperLimitActive;
+  bool prevLow = m2LowOn;
+  bool prevUp = m2UpOn;
 
-  motor2LowerLimitActive = readMotor2LowerLimit();
-  motor2UpperLimitActive = readMotor2UpperLimit();
+  m2LowOn = readMotor2LowerLimit();
+  m2UpOn = readMotor2UpperLimit();
 
-  if (motor2LowerLimitActive != previousLower) {
+  if (m2LowOn != prevLow) {
     Serial.print("LIMIT,M2,LOWER,");
-    Serial.println(motor2LowerLimitActive ? 1 : 0);
+    Serial.println(m2LowOn ? 1 : 0);
   }
 
-  if (motor2UpperLimitActive != previousUpper) {
+  if (m2UpOn != prevUp) {
     Serial.print("LIMIT,M2,UPPER,");
-    Serial.println(motor2UpperLimitActive ? 1 : 0);
+    Serial.println(m2UpOn ? 1 : 0);
   }
 
   // Never change the elbow zero while Motor 2 is under direct manual control.
   // Manual movement is often used to leave the lower limit, and an automatic
   // zero correction during that movement can briefly remove the motor output.
-  if (!ENABLE_ELBOW_AUTO_ZERO ||
-      !motor2LowerLimitActive ||
-      motor2.manualEnabled) {
-    lowerLimitStillStartMs = 0;
+  if (!AUTO_ZERO ||
+      !m2LowOn ||
+      motor2.manOn) {
+    lowStartMs = 0;
     return;
   }
 
-  bool elbowNearlyStill =
-      fabs(motor2.measuredVelocityDegPerSec) <=
-      LOWER_LIMIT_MAX_MEASURED_VELOCITY_DEG_S;
+  bool elbStill =
+      fabs(motor2.measVel) <=
+      LOW_VEL;
 
-  if (!elbowNearlyStill) {
-    lowerLimitStillStartMs = 0;
+  if (!elbStill) {
+    lowStartMs = 0;
     return;
   }
 
   unsigned long now = millis();
 
-  if (lowerLimitStillStartMs == 0) {
-    lowerLimitStillStartMs = now;
+  if (lowStartMs == 0) {
+    lowStartMs = now;
     return;
   }
 
-  bool confirmedLongEnough =
-      now - lowerLimitStillStartMs >=
-      LOWER_LIMIT_CONFIRM_MS;
+  bool heldLong =
+      now - lowStartMs >=
+      LOW_HOLDMS;
 
-  bool correctionIntervalPassed =
-      now - lastElbowZeroCorrectionMs >=
-      MIN_ZERO_CORRECTION_INTERVAL_MS;
+  bool intvOk =
+      now - lastZeroMs >=
+      ZERO_WAIT;
 
-  if (confirmedLongEnough && correctionIntervalPassed) {
+  if (heldLong && intvOk) {
     correctElbowZeroAtLowerLimit();
 
     // Require another complete confirmation period before a later correction.
-    lowerLimitStillStartMs = now;
+    lowStartMs = now;
   }
 }
 
 // Sends direction and PWM to one motor driver.
-// The motorDirectionSign is applied here so the PID logic can use the same
+// The motSign is applied here so the PID logic can use the same
 // FORWARD and REVERSE meanings for both motors.
-void driveMotor(MotorController& motor, int direction, int pwm) {
-  pwm = constrain(pwm, 0, 255);
+void driveMotor(MotorController& motor, int direction, int pwmCommand) {
+  pwmCommand = constrain(pwmCommand, 0, 255);
 
-  if (pwm <= 0 || direction == 0) {
+  if (pwmCommand <= 0 || direction == 0) {
     motorOff(motor);
     return;
   }
 
-  int actualDirection = direction * motor.motorDirectionSign;
+  int actDir = direction * motor.motSign;
 
-  if (actualDirection > 0) {
-    analogWrite(motor.in1, pwm);
-    analogWrite(motor.in2, 0);
+  if (actDir > 0) {
+    analogWrite(motor.inputPin1, pwmCommand);
+    analogWrite(motor.inputPin2, 0);
   } else {
-    analogWrite(motor.in1, 0);
-    analogWrite(motor.in2, pwm);
+    analogWrite(motor.inputPin1, 0);
+    analogWrite(motor.inputPin2, pwmCommand);
   }
 }
 
 // Removes voltage commands from both driver inputs so the motor can coast.
 void motorOff(MotorController& motor) {
-  analogWrite(motor.in1, 0);
-  analogWrite(motor.in2, 0);
+  analogWrite(motor.inputPin1, 0);
+  analogWrite(motor.inputPin2, 0);
 }
 
 // Applies active braking by setting both driver inputs high.
-// Confirm that this behavior is supported by the motor driver hardware.
+// DRV8871 truth table: IN1=1 and IN2=1 selects brake / slow decay.
 void motorHold(MotorController& motor) {
   // Active braking. Replace with motorOff(motor) if the driver should coast.
-  analogWrite(motor.in1, 255);
-  analogWrite(motor.in2, 255);
+  analogWrite(motor.inputPin1, 255);
+  analogWrite(motor.inputPin2, 255);
 }
 
 // ======================================================
-// PI/PID controller
+// PI and oscillation velocity-tracking controller
 // ======================================================
 
 // Limits a value to the range 0.0 through 1.0.
@@ -1059,22 +1095,44 @@ float clamp01(float value) {
 // When deactivate is true, the motor will stay off until a new target starts.
 void resetControllerState(MotorController& motor, bool deactivate) {
   if (deactivate) {
-    motor.active = false;
+    motor.ctrlOn = false;
+    motor.oscOn = false;
+    motor.oscPrep = false;
+    motor.oscStartMs = 0;
   }
 
-  motor.holding = false;
-  motor.manualEnabled = false;
-  motor.manualDirection = 0;
-  motor.previousError = 0.0;
-  motor.integralError = 0.0;
-  motor.previousMeasurement = feedbackAngle(motor);
-  motor.previousOutput = 0.0;
-  motor.desiredVelocityDegPerSec = 0.0;
-  motor.measuredVelocityDegPerSec = 0.0;
-  motor.normalizedEffort = 0.0;
-  motor.pwm = 0;
-  motor.signedPwmCommand = 0.0;
-  motor.targetStartMs = millis();
+  motor.brakeHold = false;
+  motor.manOn = false;
+  motor.manDir = 0;
+  motor.prevErrDeg = 0.0;
+  motor.intErr = 0.0;
+  motor.prevAngDeg = getFeedbackAngle(motor);
+  motor.prevOut = 0.0;
+  motor.desVel = 0.0;
+  motor.measVel = 0.0;
+  motor.normEff = 0.0;
+  motor.pwmCommand = 0;
+  motor.pwmCmd = 0.0;
+  motor.tgtStartMs = millis();
+  motor.oscReadyMs = 0;
+  motor.pTerm = 0.0;
+  motor.iTerm = 0.0;
+  motor.rawVTerm = 0.0;
+  motor.vTerm = 0.0;
+  motor.velLimOn = false;
+  motor.dirProtOn = false;
+  motor.oscDir = 0;
+  motor.rawOut = 0.0;
+  motor.satOut = 0.0;
+  motor.satState = 0;
+  motor.pwmLim = motor.maximumPwm;
+  motor.nearOn = false;
+  motor.brakeOn = false;
+  motor.settled = false;
+  motor.longGap = false;
+  motor.ctrlDt = 0.0;
+  motor.intDt = 0.0;
+  motor.setStartMs = 0;
 }
 
 // Prepares one motor to begin controlling a new target.
@@ -1082,28 +1140,46 @@ void resetControllerState(MotorController& motor, bool deactivate) {
 // from affecting the new movement.
 void initializeControllerForTarget(
     MotorController& motor,
-    float targetDeg
+    float tgtAngDeg
 ) {
-  float current = feedbackAngle(motor);
+  float current = getFeedbackAngle(motor);
 
-  motor.targetDeg = targetDeg;
-  motor.active = true;
-  motor.holding = false;
-  motor.manualEnabled = false;
-  motor.manualDirection = 0;
-  motor.previousError = targetDeg - current;
-  motor.integralError = 0.0;
-  motor.previousMeasurement = current;
-  motor.previousOutput = 0.0;
-  motor.desiredVelocityDegPerSec = 0.0;
-  motor.measuredVelocityDegPerSec = 0.0;
-  motor.normalizedEffort = 0.0;
-  motor.pwm = 0;
-  motor.signedPwmCommand = 0.0;
-  motor.targetStartMs = millis();
+  motor.tgtAngDeg = tgtAngDeg;
+  motor.ctrlOn = true;
+  motor.brakeHold = false;
+  motor.manOn = false;
+  motor.manDir = 0;
+  motor.prevErrDeg = tgtAngDeg - current;
+  motor.intErr = 0.0;
+  motor.prevAngDeg = current;
+  motor.prevOut = 0.0;
+  motor.desVel = 0.0;
+  motor.measVel = 0.0;
+  motor.normEff = 0.0;
+  motor.pwmCommand = 0;
+  motor.pwmCmd = 0.0;
+  motor.tgtStartMs = millis();
+  motor.pTerm = 0.0;
+  motor.iTerm = 0.0;
+  motor.rawVTerm = 0.0;
+  motor.vTerm = 0.0;
+  motor.velLimOn = false;
+  motor.dirProtOn = false;
+  motor.oscDir = 0;
+  motor.rawOut = 0.0;
+  motor.satOut = 0.0;
+  motor.satState = 0;
+  motor.pwmLim = motor.maximumPwm;
+  motor.nearOn = false;
+  motor.brakeOn = false;
+  motor.settled = false;
+  motor.longGap = false;
+  motor.ctrlDt = 0.0;
+  motor.intDt = 0.0;
+  motor.setStartMs = 0;
 }
 
-// Runs one complete PI/PID update for one motor.
+// Runs one complete PI/velocity-tracking update for one motor.
 //
 // The important steps are:
 // 1. Read the selected feedback angle.
@@ -1112,181 +1188,339 @@ void initializeControllerForTarget(
 // 4. Calculate measured angular velocity from the IMU angle.
 // 5. Compare measured velocity with the desired trajectory velocity.
 // 6. Update the integral term with anti-windup protection.
-// 7. Calculate P + I + D output.
+// 7. Calculate PI output plus oscillation-only velocity effort.
 // 8. Convert output magnitude to PWM and output sign to direction.
-void updatePid(MotorController& motor, float dtSeconds) {
-  // Manual mode directly controls the motor, so PID must not overwrite it.
-  if (motor.manualEnabled) {
+void updateMotorController(
+    MotorController& motor,
+    float ctrlDt,
+    float intDt,
+    bool longGap
+) {
+  // Save timing values for synchronized diagnostics.
+  motor.ctrlDt = ctrlDt;
+  motor.intDt = intDt;
+  motor.longGap = longGap;
+
+  // Manual mode directly controls the motor, so feedback control must not
+  // overwrite its command.
+  if (motor.manOn) {
     return;
   }
 
+  // Start every feedback-control update with clear diagnostic flags.
+  motor.pTerm = 0.0;
+  motor.iTerm = motor.kiInt * motor.intErr;
+  motor.rawVTerm = 0.0;
+  motor.vTerm = 0.0;
+  motor.velLimOn = false;
+  motor.dirProtOn = false;
+  motor.rawOut = 0.0;
+  motor.satOut = 0.0;
+  motor.satState = 0;
+  motor.pwmLim = motor.maximumPwm;
+  motor.nearOn = false;
+  motor.brakeOn = false;
+
   // Never drive a motor without valid IMU feedback or an active target.
-  if (!imuOk || !motor.active) {
+  if (!imusReady || !motor.ctrlOn) {
     motorOff(motor);
-    motor.normalizedEffort = 0.0;
-    motor.pwm = 0;
-    motor.signedPwmCommand = 0.0;
+    motor.normEff = 0.0;
+    motor.pwmCommand = 0;
+    motor.pwmCmd = 0.0;
+    motor.settled = false;
+    motor.setStartMs = 0;
     return;
   }
 
   // Positive error means the measured angle is below the target.
   // Negative error means the measured angle is above the target.
-  float current = feedbackAngle(motor);
-  float error = motor.targetDeg - current;
-  float absoluteError = fabs(error);
+  float current = getFeedbackAngle(motor);
+  float error = motor.tgtAngDeg - current;
+  float absErr = fabs(error);
 
-  bool errorChangedSign =
-      (error > 0.0 && motor.previousError < 0.0) ||
-      (error < 0.0 && motor.previousError > 0.0);
+  // Calculate measured angular velocity before checking the target band so
+  // The monitor still receives a real velocity value while the brake is active.
+  if (longGap || ctrlDt <= 0.0) {
+    motor.measVel = 0.0;
+  } else {
+    float rawMeasV =
+        (current - motor.prevAngDeg) / ctrlDt;
 
-  // Reset the integral when the motor passes the target. This reduces the
-  // chance that stored integral error keeps pushing in the old direction.
-  if (errorChangedSign) {
-    motor.integralError = 0.0;
+    motor.measVel =
+        VEL_FILT * rawMeasV +
+        (1.0 - VEL_FILT) *
+            motor.measVel;
   }
 
-  bool atFixedTarget = false;
+  float velErr =
+      motor.desVel -
+      motor.measVel;
 
-  if (!motor.oscillationEnabled) {
-    float exitTolerance = motor.toleranceDeg * 1.5;
-    atFixedTarget = motor.holding
-        ? (absoluteError <= exitTolerance)
-        : (absoluteError <= motor.toleranceDeg);
+  bool errFlip =
+      (error > 0.0 && motor.prevErrDeg < 0.0) ||
+      (error < 0.0 && motor.prevErrDeg > 0.0);
+
+  // Reset integral on a fixed-target crossing, but not while tracking the
+  // moving oscillation reference. Repeated resets during oscillation would
+  // create discontinuities and prevent correction of persistent bias.
+  if (!motor.oscOn && errFlip) {
+    motor.intErr = 0.0;
   }
 
-  // Fixed targets use a tolerance area. Oscillation does not stop at each
-  // temporary target because its target is always moving.
-  if (atFixedTarget) {
+  bool fixedTgt = false;
+
+  if (!motor.oscOn) {
+    float exitTol = motor.tgtTolDeg * 1.5;
+    fixedTgt = motor.brakeHold
+        ? (absErr <= exitTol)
+        : (absErr <= motor.tgtTolDeg);
+  }
+
+  // Fixed targets and oscillation pre-positioning use the DRV8871 brake state
+  // inside the target band. Running oscillation never stops at each moving
+  // target because its reference is continuously changing.
+  if (fixedTgt) {
     motorHold(motor);
-    motor.normalizedEffort = 0.0;
-    motor.pwm = 0;
-    motor.signedPwmCommand = 0.0;
-    motor.integralError = 0.0;
-    motor.previousError = error;
-    motor.previousMeasurement = current;
-    motor.previousOutput = 0.0;
-    motor.holding = true;
-    motor.targetStartMs = millis();
+    motor.normEff = 0.0;
+    motor.pwmCommand = 0;
+    motor.pwmCmd = 0.0;
+    motor.intErr = 0.0;
+    motor.iTerm = 0.0;
+    motor.prevErrDeg = error;
+    motor.prevAngDeg = current;
+    motor.prevOut = 0.0;
+    motor.brakeHold = true;
+    motor.brakeOn = true;
+    motor.pwmLim = 0;
+    motor.tgtStartMs = millis();
+
+    // Settled is a reporting condition only; braking begins immediately when
+    // position enters the tolerance band.
+    if (!longGap &&
+        fabs(motor.measVel) <=
+            SET_VEL) {
+      if (motor.setStartMs == 0) {
+        motor.setStartMs = millis();
+      }
+
+      motor.settled =
+          millis() - motor.setStartMs >= SET_MS;
+    } else {
+      motor.setStartMs = 0;
+      motor.settled = false;
+    }
+
     return;
   }
 
-  if (motor.holding) {
-    motor.holding = false;
-    motor.integralError = 0.0;
-    motor.previousError = error;
-    motor.previousMeasurement = current;
-    motor.previousOutput = 0.0;
-    motor.targetStartMs = millis();
+  if (motor.brakeHold) {
+    motor.brakeHold = false;
+    motor.intErr = 0.0;
+    motor.prevErrDeg = error;
+    motor.prevAngDeg = current;
+    motor.prevOut = 0.0;
+    motor.tgtStartMs = millis();
   }
 
-  // Stop a fixed-target movement if it takes too long. This helps protect
-  // the user and hardware when the system is blocked or cannot reach target.
-  if (!motor.oscillationEnabled &&
-      millis() - motor.targetStartMs > motor.fixedTargetTimeoutMs) {
+  motor.setStartMs = 0;
+  motor.settled = false;
+
+  // Stop a fixed-target or oscillation-preposition movement if it takes too
+  // long. Running oscillation is exempt because it is intentionally continuous.
+  if (!motor.oscOn &&
+      millis() - motor.tgtStartMs > motor.tgtToutMs) {
     stopMotor(motor, "fixed_target_timeout");
     return;
   }
 
-  // Use a lower PWM limit near a fixed target for smoother stopping.
-  int pwmLimit = motor.maxPwm;
+  // Use a lower PWM range near a fixed target. Running oscillation retains the
+  // full PWM range so its position and velocity terms can track the trajectory.
+  int pwmLimit = motor.maximumPwm;
 
-  if (!motor.oscillationEnabled &&
-      absoluteError <= motor.slowZoneDeg) {
-    pwmLimit = motor.slowPwm;
+  if (!motor.oscOn &&
+      absErr <= motor.nearDeg) {
+    pwmLimit = motor.nearPwm;
+    motor.nearOn = true;
   }
 
-  // Calculate angular velocity from the change in measured angle.
-  // The raw derivative can be noisy, so it is passed through a low-pass
-  // filter before it is used by the controller.
-  float rawMeasurementVelocity =
-      (current - motor.previousMeasurement) / dtSeconds;
+  motor.pwmLim = pwmLimit;
+  motor.pTerm = motor.kpPos * error;
 
-  motor.measuredVelocityDegPerSec =
-      VELOCITY_FILTER_ALPHA * rawMeasurementVelocity +
-      (1.0 - VELOCITY_FILTER_ALPHA) *
-          motor.measuredVelocityDegPerSec;
+  // Velocity tracking is active only during oscillation.
+  // The raw velocity term is saved for the monitor, then limited before it can
+  // affect anti-windup, saturation calculations, or the physical motor command.
+  motor.rawVTerm = motor.oscOn
+      ? motor.kvVel * velErr
+      : 0.0;
 
-  // This is the derivative of position error. For a fixed target, desired
-  // velocity is zero, so the term adds damping. During oscillation, desired
-  // velocity comes directly from the derivative of the cosine trajectory.
-  float velocityError =
-      motor.desiredVelocityDegPerSec -
-      motor.measuredVelocityDegPerSec;
+  float velLim = max(
+      fabsf(motor.velLim),
+      0.0f
+  );
 
-  // Anti-windup check: when output is already at full effort in the same
-  // direction as the error, more integral error would not help.
-  bool outputSaturated =
-      (fabs(motor.previousOutput) >= fabs(motor.uFull)) &&
-      ((motor.previousOutput > 0.0) == (error > 0.0));
-
-  // Conditional integration provides anti-windup.
-  if (!outputSaturated) {
-    motor.integralError += error * dtSeconds;
-  }
-
-  if (fabs(motor.ki) > 0.000001) {
-    float integralLimit = fabs(motor.uFull / motor.ki);
-    motor.integralError = constrain(
-        motor.integralError,
-        -integralLimit,
-        integralLimit
+  if (motor.oscOn && velLim > 0.0f) {
+    motor.vTerm = constrain(
+        motor.rawVTerm,
+        -velLim,
+        velLim
     );
   } else {
-    motor.integralError = 0.0;
+    motor.vTerm = motor.rawVTerm;
   }
 
-  // This is the trajectory-tracking PID equation.
-  // P corrects angle error.
-  // I corrects angle error that continues over time.
-  // D corrects velocity error.
-  float controllerOutput =
-      motor.kp * error +
-      motor.ki * motor.integralError +
-      motor.kd * velocityError;
+  motor.velLimOn =
+      fabsf(motor.rawVTerm - motor.vTerm) > 0.000001f;
 
-  // Determine the requested direction before saving the output. If Motor 2
-  // is already at a mechanical limit, block only the direction that would
-  // push farther into that limit and erase stored integral effort.
-  int direction =
-      controllerOutput >= 0.0 ? FORWARD : REVERSE;
+  // Current-cycle, sign-aware conditional integration. First calculate the
+  // integral and output that would result if this cycle were accepted.
+  float intTry = motor.intErr;
 
-  if (motorDirectionBlockedByElbowSafety(
-          motor,
-          direction
-      )) {
+  if (intDt > 0.0) {
+    intTry += error * intDt;
+  }
+
+  if (fabs(motor.kiInt) > 0.000001) {
+    float intLim = fabs(motor.uFull / motor.kiInt);
+    intTry = constrain(
+        intTry,
+        -intLim,
+        intLim
+    );
+  } else {
+    intTry = 0.0;
+    motor.intErr = 0.0;
+  }
+
+  float outTry =
+      motor.pTerm +
+      motor.kiInt * intTry +
+      motor.vTerm;
+
+  bool satHigh = outTry > motor.uFull;
+  bool satLow = outTry < -motor.uFull;
+
+  // Normal integration is allowed when unsaturated. While saturated, permit
+  // only an error direction that moves the controller back toward the range.
+  bool intOk =
+      intDt > 0.0 &&
+      ((!satHigh && !satLow) ||
+       (satHigh && error < 0.0) ||
+       (satLow && error > 0.0));
+
+  if (intOk) {
+    motor.intErr = intTry;
+  }
+
+  // Retain a hard integral limit as a backup to conditional anti-windup.
+  if (fabs(motor.kiInt) > 0.000001) {
+    float intLim = fabs(motor.uFull / motor.kiInt);
+    motor.intErr = constrain(
+        motor.intErr,
+        -intLim,
+        intLim
+    );
+  } else {
+    motor.intErr = 0.0;
+  }
+
+  motor.iTerm = motor.kiInt * motor.intErr;
+  motor.rawOut =
+      motor.pTerm +
+      motor.iTerm +
+      motor.vTerm;
+
+  if (motor.rawOut > motor.uFull) {
+    motor.satState = 1;
+  } else if (motor.rawOut < -motor.uFull) {
+    motor.satState = -1;
+  } else {
+    motor.satState = 0;
+  }
+
+  // Explicitly clamp the signed controller effort before PWM mapping. This
+  // keeps the monitor values and the real motor command consistent.
+  motor.satOut = constrain(
+      motor.rawOut,
+      -motor.uFull,
+      motor.uFull
+  );
+
+  float ctrlOut = motor.satOut;
+
+  // Running oscillation uses a small output deadband and a larger reversal
+  // threshold. This prevents a tiny sign change from immediately becoming a
+  // full minimum-PWM command in the opposite direction. While the controller
+  // is inside either protection region, the driver coasts. The integral is
+  // still allowed to build enough meaningful effort to leave the region.
+  if (motor.oscOn) {
+    float absOut = fabsf(ctrlOut);
+    int reqDir = ctrlOut > 0.0 ? FORWARD : REVERSE;
+
+    bool inDead =
+        absOut < motor.oscDead;
+
+    bool weakRev =
+        motor.oscDir != 0 &&
+        reqDir != motor.oscDir &&
+        absOut < motor.dirThres;
+
+    if (inDead || weakRev) {
+      motorOff(motor);
+      motor.dirProtOn = true;
+      motor.prevErrDeg = error;
+      motor.prevAngDeg = current;
+      motor.prevOut = 0.0;
+      motor.normEff = 0.0;
+      motor.pwmCommand = 0;
+      motor.pwmCmd = 0.0;
+      return;
+    }
+
+    motor.oscDir = reqDir;
+  } else {
+    motor.oscDir = 0;
+  }
+
+  if (fabs(ctrlOut) < 0.0001) {
+    motorOff(motor);
+    motor.prevErrDeg = error;
+    motor.prevAngDeg = current;
+    motor.prevOut = 0.0;
+    motor.normEff = 0.0;
+    motor.pwmCommand = 0;
+    motor.pwmCmd = 0.0;
+    return;
+  }
+
+  int direction = ctrlOut > 0.0 ? FORWARD : REVERSE;
+
+  // If Motor 2 is at a mechanical limit, block only the direction that would
+  // push farther into the limit and erase all stored controller effort.
+  if (motorDirectionBlockedByElbowSafety(motor, direction)) {
     clearMotorCommandAtLimit(motor);
     return;
   }
 
-  motor.previousError = error;
-  motor.previousMeasurement = current;
-  motor.previousOutput = controllerOutput;
+  motor.prevErrDeg = error;
+  motor.prevAngDeg = current;
+  motor.prevOut = ctrlOut;
 
-  // Convert controller output to a value from 0 to 1, then map that value
-  // between the motor's minimum and maximum allowed PWM.
   float fullOutput = max(fabsf(motor.uFull), 0.000001f);
-  float normalizedEffort =
-      clamp01(fabs(controllerOutput) / fullOutput);
+  float normEff =
+      clamp01(fabs(ctrlOut) / fullOutput);
 
-  int minimumPwm = min(motor.minPwm, pwmLimit);
-  int pwm = minimumPwm +
-      (int)((pwmLimit - minimumPwm) * normalizedEffort);
+  int minimumPwm = min(motor.minimumPwm, pwmLimit);
+  int pwmCommand = minimumPwm +
+      (int)((pwmLimit - minimumPwm) * normEff);
 
-  if (fabs(controllerOutput) < 0.0001) {
-    pwm = 0;
-    normalizedEffort = 0.0;
-  }
-
-  // The sign controls direction. The size controls PWM effort.
   float signedPwm =
-      direction * motor.motorDirectionSign * pwm;
+      direction * motor.motSign * pwmCommand;
 
-  motor.normalizedEffort = normalizedEffort;
-  motor.pwm = pwm;
-  motor.signedPwmCommand = signedPwm;
+  motor.normEff = normEff;
+  motor.pwmCommand = pwmCommand;
+  motor.pwmCmd = signedPwm;
 
-  // Send the final command to the physical motor driver.
-  driveMotor(motor, direction, pwm);
+  driveMotor(motor, direction, pwmCommand);
 }
 
 // ======================================================
@@ -1297,10 +1531,10 @@ void updatePid(MotorController& motor, float dtSeconds) {
 // At time zero the target is center-amplitude. It rises smoothly to
 // center+amplitude, returns, and then repeats. With the current settings,
 // the planned range is 10 to 80 degrees.
-float calculateOscillationTarget(float timeSeconds) {
-  return OSCILLATION_CENTER_DEG -
-      OSCILLATION_AMPLITUDE_DEG *
-      cos(2.0 * PI * OSCILLATION_FREQUENCY_HZ * timeSeconds);
+float calculateOscillationTargetAngle(float timeSec) {
+  return OSC_CTR -
+      OSC_AMP *
+      cos(2.0 * PI * OSC_HZ * timeSec);
 }
 
 // Calculates desired angular velocity by differentiating the target function.
@@ -1309,78 +1543,123 @@ float calculateOscillationTarget(float timeSeconds) {
 // velocity(t) = amplitude * 2*pi*f * sin(2*pi*f*t)
 //
 // The result is in degrees per second because amplitude is in degrees.
-float calculateOscillationVelocity(float timeSeconds) {
-  float angularFrequency =
-      2.0 * PI * OSCILLATION_FREQUENCY_HZ;
+float calculateOscillationVelocity(float timeSec) {
+  float angFreq =
+      2.0 * PI * OSC_HZ;
 
-  return OSCILLATION_AMPLITUDE_DEG *
-      angularFrequency *
-      sin(angularFrequency * timeSeconds);
+  return OSC_AMP *
+      angFreq *
+      sin(angFreq * timeSec);
 }
 
-// Starts oscillation for one motor and initializes its PID state.
+// Starts oscillation by first moving to the lower endpoint. The actual cosine
+// trajectory begins only after the endpoint is settled for a short time.
 void startOscillation(MotorController& motor) {
-  motor.manualEnabled = false;
-  motor.manualDirection = 0;
-  motor.oscillationEnabled = true;
-  motor.oscillationStartMs = millis();
+  motor.manOn = false;
+  motor.manDir = 0;
+  motor.oscOn = false;
+  motor.oscPrep = true;
+  motor.oscStartMs = 0;
+  motor.oscReadyMs = 0;
+
   initializeControllerForTarget(
       motor,
-      calculateOscillationTarget(0.0)
+      calculateOscillationTargetAngle(0.0)
   );
-  motor.desiredVelocityDegPerSec =
-      calculateOscillationVelocity(0.0);
+  motor.desVel = 0.0;
 
   Serial.print(motor.name);
-  Serial.print(" oscillation started at ");
-  Serial.print(OSCILLATION_FREQUENCY_HZ, 3);
-  Serial.print(" Hz. Maximum desired speed: " );
-  Serial.print(
-      OSCILLATION_AMPLITUDE_DEG *
-      2.0 * PI * OSCILLATION_FREQUENCY_HZ,
-      2
-  );
-  Serial.println(" deg/s.");
+  Serial.print(" oscillation preparing at ");
+  Serial.print(motor.tgtAngDeg, 2);
+  Serial.println(" degrees.");
 }
 
-// Stops changing the target. This function does not stop motor output by
-// itself; stopMotor() is used when the motor must also be turned off.
+// Clears both oscillation-running and oscillation-preparation states.
 void stopOscillation(MotorController& motor) {
-  motor.oscillationEnabled = false;
-  motor.oscillationStartMs = 0;
-  motor.desiredVelocityDegPerSec = 0.0;
+  motor.oscOn = false;
+  motor.oscPrep = false;
+  motor.oscStartMs = 0;
+  motor.oscReadyMs = 0;
+  motor.desVel = 0.0;
+  motor.rawVTerm = 0.0;
+  motor.vTerm = 0.0;
+  motor.velLimOn = false;
+  motor.dirProtOn = false;
+  motor.oscDir = 0;
 }
 
-// Updates the motor's target angle during every control cycle.
+// Updates preparation or the running oscillation target every control cycle.
 void updateOscillationTarget(MotorController& motor) {
-  if (!motor.oscillationEnabled) {
+  if (motor.oscPrep) {
+    motor.tgtAngDeg = calculateOscillationTargetAngle(0.0);
+    motor.desVel = 0.0;
+    motor.ctrlOn = true;
+
+    if (motor.brakeHold && motor.settled) {
+      if (motor.oscReadyMs == 0) {
+        motor.oscReadyMs = millis();
+      }
+
+      if (millis() - motor.oscReadyMs >=
+          PREP_MS) {
+        motor.oscPrep = false;
+        motor.oscOn = true;
+        motor.oscStartMs = millis();
+        motor.oscReadyMs = 0;
+
+        initializeControllerForTarget(
+            motor,
+            calculateOscillationTargetAngle(0.0)
+        );
+        motor.desVel =
+            calculateOscillationVelocity(0.0);
+
+        Serial.print(motor.name);
+        Serial.print(" oscillation running at ");
+        Serial.print(OSC_HZ, 3);
+        Serial.print(" Hz. Maximum desired speed: ");
+        Serial.print(
+            OSC_AMP *
+            2.0 * PI * OSC_HZ,
+            2
+        );
+        Serial.println(" deg/s.");
+      }
+    } else {
+      motor.oscReadyMs = 0;
+    }
+
     return;
   }
 
-  float elapsedSeconds =
-      (millis() - motor.oscillationStartMs) / 1000.0;
+  if (!motor.oscOn) {
+    return;
+  }
 
-  motor.targetDeg = calculateOscillationTarget(elapsedSeconds);
-  motor.desiredVelocityDegPerSec =
-      calculateOscillationVelocity(elapsedSeconds);
-  motor.active = true;
-  motor.holding = false;
+  float runSec =
+      (millis() - motor.oscStartMs) / 1000.0;
+
+  motor.tgtAngDeg = calculateOscillationTargetAngle(runSec);
+  motor.desVel =
+      calculateOscillationVelocity(runSec);
+  motor.ctrlOn = true;
+  motor.brakeHold = false;
 }
 
 // Stops oscillation and starts movement toward one fixed angle.
 // The allowed target range is limited to 0 through 90 degrees.
-void setFixedTarget(MotorController& motor, float targetDeg) {
-  motor.manualEnabled = false;
-  motor.manualDirection = 0;
+void setFixedTarget(MotorController& motor, float tgtAngDeg) {
+  motor.manOn = false;
+  motor.manDir = 0;
   stopOscillation(motor);
-  targetDeg = constrain(targetDeg, 0.0f, 90.0f);
-  initializeControllerForTarget(motor, targetDeg);
+  tgtAngDeg = constrain(tgtAngDeg, 0.0f, 90.0f);
+  initializeControllerForTarget(motor, tgtAngDeg);
 
   Serial.print(motor.name);
   Serial.print(" fixed target set to ");
-  Serial.print(targetDeg, 2);
+  Serial.print(tgtAngDeg, 2);
   Serial.print(" degrees using ");
-  Serial.print(feedbackName(motor));
+  Serial.print(getFeedbackName(motor));
   Serial.println(" feedback.");
 }
 
@@ -1389,7 +1668,7 @@ void setFixedTarget(MotorController& motor, float targetDeg) {
 // Unlike PID control, this mode does not use an angle target and will keep
 // moving until another command changes the mode or stops the motors.
 void startManualDrive(MotorController& motor, int direction) {
-  if (!imuOk) {
+  if (!imusReady) {
     motorOff(motor);
     Serial.print("Manual control blocked for ");
     Serial.print(motor.name);
@@ -1398,7 +1677,7 @@ void startManualDrive(MotorController& motor, int direction) {
   }
 
   // Convert every manual request into one of the two valid logical directions.
-  int requestedDirection = direction >= 0 ? FORWARD : REVERSE;
+  int reqDir = direction >= 0 ? FORWARD : REVERSE;
 
   // Refresh the sensor and limit states immediately. This avoids using a stale
   // limit flag when a manual command arrives between normal 100 Hz updates.
@@ -1409,103 +1688,118 @@ void startManualDrive(MotorController& motor, int direction) {
   // limit. The opposite direction remains available so the user can move away.
   if (motorDirectionBlockedByElbowSafety(
           motor,
-          requestedDirection
+          reqDir
       )) {
     motorOff(motor);
     resetControllerState(motor, true);
-    motor.targetDeg = feedbackAngle(motor);
+    motor.tgtAngDeg = getFeedbackAngle(motor);
 
     Serial.print("MANUAL_BLOCKED,");
     Serial.print(motor.name);
     Serial.print(",");
     Serial.print(
-        requestedDirection == FORWARD
+        reqDir == FORWARD
             ? "upper_limit"
             : "lower_limit"
     );
     Serial.print(",counts=");
-    Serial.print(encoderCounts(motor));
+    Serial.print(getEncoderCounts(motor));
     Serial.print(",angle=");
-    Serial.println(feedbackAngle(motor), 3);
+    Serial.println(getFeedbackAngle(motor), 3);
     return;
   }
 
   stopOscillation(motor);
 
-  motor.active = false;
-  motor.holding = false;
-  motor.manualEnabled = true;
-  motor.manualDirection = requestedDirection;
+  motor.ctrlOn = false;
+  motor.brakeHold = false;
+  motor.manOn = true;
+  motor.manDir = reqDir;
 
-  motor.targetDeg = feedbackAngle(motor);
-  motor.previousError = 0.0;
-  motor.integralError = 0.0;
-  motor.previousMeasurement = feedbackAngle(motor);
-  motor.previousOutput = 0.0;
-  motor.desiredVelocityDegPerSec = 0.0;
-  motor.measuredVelocityDegPerSec = 0.0;
+  motor.tgtAngDeg = getFeedbackAngle(motor);
+  motor.prevErrDeg = 0.0;
+  motor.intErr = 0.0;
+  motor.prevAngDeg = getFeedbackAngle(motor);
+  motor.prevOut = 0.0;
+  motor.desVel = 0.0;
+  motor.measVel = 0.0;
 
   // Apply the command immediately instead of waiting for the next loop cycle.
   updateManualDrive(motor);
 
   Serial.print(motor.name);
   Serial.print(" manual mode: ");
-  Serial.print(motor.manualDirection == FORWARD ? "forward/up" : "reverse/down");
+  Serial.print(motor.manDir == FORWARD ? "forward/up" : "reverse/down");
   Serial.print(" at PWM ");
   Serial.println(MANUAL_PWM);
 }
 
-// Keeps the manual PWM command active and updates the telemetry values.
+// Keeps the manual PWM command active and updates the monitor values.
 void updateManualDrive(MotorController& motor) {
-  if (!motor.manualEnabled) {
+  if (!motor.manOn) {
     return;
   }
 
-  if (!imuOk) {
+  if (!imusReady) {
     motorOff(motor);
-    motor.pwm = 0;
-    motor.normalizedEffort = 0.0;
-    motor.signedPwmCommand = 0.0;
+    motor.pwmCommand = 0;
+    motor.normEff = 0.0;
+    motor.pwmCmd = 0.0;
     return;
   }
 
   if (motorDirectionBlockedByElbowSafety(
           motor,
-          motor.manualDirection
+          motor.manDir
       )) {
-    int blockedDirection = motor.manualDirection;
+    int blockDir = motor.manDir;
 
-    motor.manualEnabled = false;
-    motor.manualDirection = 0;
+    motor.manOn = false;
+    motor.manDir = 0;
     clearMotorCommandAtLimit(motor);
 
     Serial.print("MANUAL_LIMIT_STOP,");
     Serial.print(motor.name);
     Serial.print(",");
     Serial.print(
-        blockedDirection == FORWARD
+        blockDir == FORWARD
             ? "upper_limit"
             : "lower_limit"
     );
     Serial.print(",counts=");
-    Serial.print(encoderCounts(motor));
+    Serial.print(getEncoderCounts(motor));
     Serial.print(",angle=");
-    Serial.println(feedbackAngle(motor), 3);
+    Serial.println(getFeedbackAngle(motor), 3);
     return;
   }
 
-  int pwm = constrain(MANUAL_PWM, 0, motor.maxPwm);
-  float normalized = motor.maxPwm > 0
-      ? (float)pwm / (float)motor.maxPwm
+  int pwmCommand = constrain(MANUAL_PWM, 0, motor.maximumPwm);
+  float normalized = motor.maximumPwm > 0
+      ? (float)pwmCommand / (float)motor.maximumPwm
       : 0.0;
 
-  motor.pwm = pwm;
-  motor.normalizedEffort = clamp01(normalized);
-  motor.signedPwmCommand =
-      motor.manualDirection * motor.motorDirectionSign * pwm;
-  motor.targetDeg = feedbackAngle(motor);
+  motor.pwmCommand = pwmCommand;
+  motor.normEff = clamp01(normalized);
+  motor.pwmCmd =
+      motor.manDir * motor.motSign * pwmCommand;
+  motor.tgtAngDeg = getFeedbackAngle(motor);
+  motor.pTerm = 0.0;
+  motor.iTerm = 0.0;
+  motor.rawVTerm = 0.0;
+  motor.vTerm = 0.0;
+  motor.velLimOn = false;
+  motor.dirProtOn = false;
+  motor.oscDir = 0;
+  motor.rawOut = 0.0;
+  motor.satOut = 0.0;
+  motor.satState = 0;
+  motor.pwmLim = motor.maximumPwm;
+  motor.nearOn = false;
+  motor.brakeOn = false;
+  motor.settled = false;
+  motor.setStartMs = 0;
 
-  driveMotor(motor, motor.manualDirection, pwm);
+  driveMotor(motor, motor.manDir, pwmCommand);
 }
 
 // Safely stops and deactivates one motor.
@@ -1514,7 +1808,7 @@ void stopMotor(MotorController& motor, const char* reason) {
   stopOscillation(motor);
   motorOff(motor);
   resetControllerState(motor, true);
-  motor.targetDeg = feedbackAngle(motor);
+  motor.tgtAngDeg = getFeedbackAngle(motor);
 
   Serial.print("STOP,");
   Serial.print(motor.name);
@@ -1533,8 +1827,8 @@ void stopAllMotion(const char* reason) {
   resetControllerState(motor1, true);
   resetControllerState(motor2, true);
 
-  motor1.targetDeg = feedbackAngle(motor1);
-  motor2.targetDeg = feedbackAngle(motor2);
+  motor1.tgtAngDeg = getFeedbackAngle(motor1);
+  motor2.tgtAngDeg = getFeedbackAngle(motor2);
 
   Serial.print("STOP,ALL,");
   Serial.println(reason);
@@ -1551,23 +1845,23 @@ void checkSerialCommands() {
   while (Serial.available() > 0) {
     char command = Serial.read();
 
-    if (serialEscapeState == 0) {
+    if (keyState == 0) {
       if (command == 27) {
-        serialEscapeState = 1;
+        keyState = 1;
       } else if (command != '\n' && command != '\r') {
         handleSerialCommand(command);
       }
       continue;
     }
 
-    if (serialEscapeState == 1) {
-      serialEscapeState = command == '[' ? 2 : 0;
+    if (keyState == 1) {
+      keyState = command == '[' ? 2 : 0;
       continue;
     }
 
-    if (serialEscapeState == 2) {
+    if (keyState == 2) {
       handleArrowCommand(command);
-      serialEscapeState = 0;
+      keyState = 0;
     }
   }
 }
@@ -1575,28 +1869,29 @@ void checkSerialCommands() {
 // Connects each keyboard/serial command to a controller action.
 void handleSerialCommand(char command) {
   if (command == 'j' || command == 'J') {
-    selectedMotor = &motor1;
+    selMotor = &motor1;
     Serial.println("Selected Motor 1.");
     return;
   }
 
   if (command == 'k' || command == 'K') {
-    selectedMotor = &motor2;
+    selMotor = &motor2;
     Serial.println("Selected Motor 2.");
     return;
   }
 
   if (command >= '0' && command <= '9') {
     int index = command - '0';
-    setFixedTarget(*selectedMotor, PRESET_TARGETS_DEG[index]);
+    setFixedTarget(*selMotor, TGT_LIST[index]);
     return;
   }
 
   if (command == 'x' || command == 'X') {
-    if (selectedMotor->oscillationEnabled) {
-      stopMotor(*selectedMotor, "oscillation_stopped");
+    if (selMotor->oscOn ||
+        selMotor->oscPrep) {
+      stopMotor(*selMotor, "oscillation_stopped");
     } else {
-      startOscillation(*selectedMotor);
+      startOscillation(*selMotor);
     }
     return;
   }
@@ -1604,12 +1899,12 @@ void handleSerialCommand(char command) {
   // The Python visualizer sends simple a/d commands for the arrow keys.
   // Single-byte commands are more dependable than terminal escape sequences.
   if (command == 'a' || command == 'A') {
-    startManualDrive(*selectedMotor, REVERSE);
+    startManualDrive(*selMotor, REVERSE);
     return;
   }
 
   if (command == 'd' || command == 'D') {
-    startManualDrive(*selectedMotor, FORWARD);
+    startManualDrive(*selMotor, FORWARD);
     return;
   }
 
@@ -1640,12 +1935,12 @@ void handleSerialCommand(char command) {
 // D is left/reverse. C is right/forward.
 void handleArrowCommand(char arrowCode) {
   if (arrowCode == 'D') {
-    startManualDrive(*selectedMotor, REVERSE);
+    startManualDrive(*selMotor, REVERSE);
     return;
   }
 
   if (arrowCode == 'C') {
-    startManualDrive(*selectedMotor, FORWARD);
+    startManualDrive(*selMotor, FORWARD);
   }
 }
 
@@ -1654,20 +1949,24 @@ void handleArrowCommand(char arrowCode) {
 // ======================================================
 
 // Converts internal motor state into a readable mode name.
-const char* controlModeName(const MotorController& motor) {
-  if (motor.manualEnabled) {
+const char* getControlModeName(const MotorController& motor) {
+  if (motor.manOn) {
     return "Manual";
   }
 
-  if (motor.oscillationEnabled) {
+  if (motor.oscPrep) {
+    return "OscPrep";
+  }
+
+  if (motor.oscOn) {
     return "Oscillation";
   }
 
-  if (motor.holding) {
-    return "Holding";
+  if (motor.brakeHold) {
+    return "HoldBrake";
   }
 
-  if (motor.active) {
+  if (motor.ctrlOn) {
     return "FixedTarget";
   }
 
@@ -1675,7 +1974,7 @@ const char* controlModeName(const MotorController& motor) {
 }
 
 // Prints one quaternion for the Python 3D arm display.
-void printQuaternion(const char* label, Quat q) {
+void printQuaternion(const char* label, QuaternionData q) {
   Serial.print(label);
   Serial.print(": ");
   Serial.print(q.w, 6);
@@ -1692,26 +1991,26 @@ void printQuaternion(const char* label, Quat q) {
 void printTelemetry() {
   unsigned long now = millis();
 
-  if (now - lastTelemetryMs < TELEMETRY_PERIOD_MS) {
+  if (now - lastSendMs < SEND_MS) {
     return;
   }
 
-  lastTelemetryMs = now;
+  lastSendMs = now;
 
-  float m1Current = feedbackAngle(motor1);
-  float m2Current = feedbackAngle(motor2);
+  float m1Current = getFeedbackAngle(motor1);
+  float m2Current = getFeedbackAngle(motor2);
 
-  float m1Error = motor1.active && !motor1.manualEnabled
-      ? motor1.targetDeg - m1Current
+  float m1Error = motor1.ctrlOn && !motor1.manOn
+      ? motor1.tgtAngDeg - m1Current
       : 0.0;
 
-  float m2Error = motor2.active && !motor2.manualEnabled
-      ? motor2.targetDeg - m2Current
+  float m2Error = motor2.ctrlOn && !motor2.manOn
+      ? motor2.tgtAngDeg - m2Current
       : 0.0;
 
   readImuCalibrationStatus();
 
-  // Calibration telemetry is separate so the existing STATE parser remains
+  // Calibration data is separate so the existing STATE parser remains
   // compatible with older Python visualizers.
   //
   // CALIBRATION,time_ms,
@@ -1720,46 +2019,46 @@ void printTelemetry() {
   Serial.print("CALIBRATION,");
   Serial.print(now);
   Serial.print(",");
-  Serial.print(upperSystemCal);
+  Serial.print(upSysCal);
   Serial.print(",");
-  Serial.print(upperGyroCal);
+  Serial.print(upGyrCal);
   Serial.print(",");
-  Serial.print(upperAccelCal);
+  Serial.print(upAccCal);
   Serial.print(",");
-  Serial.print(upperMagCal);
+  Serial.print(upMagCal);
   Serial.print(",");
-  Serial.print(forearmSystemCal);
+  Serial.print(frSysCal);
   Serial.print(",");
-  Serial.print(forearmGyroCal);
+  Serial.print(frGyrCal);
   Serial.print(",");
-  Serial.print(forearmAccelCal);
+  Serial.print(frAccCal);
   Serial.print(",");
-  Serial.println(forearmMagCal);
+  Serial.println(frMagCal);
 
-  // Safety telemetry:
+  // Safety data:
   // SAFETY,time_ms,lower_active,upper_active,encoder_counts,
   // raw_joint,filtered_uncorrected,zero_offset,corrected_joint,corrections
   Serial.print("SAFETY,");
   Serial.print(now);
   Serial.print(",");
-  Serial.print(motor2LowerLimitActive ? 1 : 0);
+  Serial.print(m2LowOn ? 1 : 0);
   Serial.print(",");
-  Serial.print(motor2UpperLimitActive ? 1 : 0);
+  Serial.print(m2UpOn ? 1 : 0);
   Serial.print(",");
-  Serial.print(encoderCounts(motor2));
+  Serial.print(getEncoderCounts(motor2));
   Serial.print(",");
-  Serial.print(rawJointAngleDeg, 4);
+  Serial.print(rawJntDeg, 4);
   Serial.print(",");
-  Serial.print(filteredJointAngleDeg, 4);
+  Serial.print(filtJntDeg, 4);
   Serial.print(",");
-  Serial.print(elbowZeroOffsetDeg, 4);
+  Serial.print(elbZeroDeg, 4);
   Serial.print(",");
-  Serial.print(jointAngleDeg, 4);
+  Serial.print(jntAngDeg, 4);
   Serial.print(",");
-  Serial.println(elbowZeroCorrectionCount);
+  Serial.println(zeroCnt);
 
   // Send the exact velocity values used inside the controller.
-  // The temporary angle/velocity visualizer reads this line directly.
+  // The Python monitor reads this line directly.
   // Sending it before STATE makes sure the matching velocity values are
   // available when the Python program receives the new state sample.
   //
@@ -1769,15 +2068,61 @@ void printTelemetry() {
   Serial.print("VELOCITY,");
   Serial.print(now);
   Serial.print(",");
-  Serial.print(motor1.desiredVelocityDegPerSec, 4);
+  Serial.print(motor1.desVel, 4);
   Serial.print(",");
-  Serial.print(motor1.measuredVelocityDegPerSec, 4);
+  Serial.print(motor1.measVel, 4);
   Serial.print(",");
-  Serial.print(motor2.desiredVelocityDegPerSec, 4);
+  Serial.print(motor2.desVel, 4);
   Serial.print(",");
-  Serial.println(motor2.measuredVelocityDegPerSec, 4);
+  Serial.println(motor2.measVel, 4);
 
-  // Parsed by final_dual_motor_monitor.py.
+  // Motor 2 controller diagnostics. This record is timestamp-matched with the
+  // following STATE line by the Python visualizer and live monitor.
+  // CONTROL2,time_ms,p_term,i_term,velocity_term,integral_state,
+  // unsaturated_output,saturated_output,saturation_state,active_pwm_limit,
+  // slow_zone,brake_active,settled,actual_dt,integration_dt,long_gap,
+  // raw_velocity_term,velocity_limit_active,direction_protection_active,
+  // oscillation_drive_direction
+  Serial.print("CONTROL2,");
+  Serial.print(now);
+  Serial.print(",");
+  Serial.print(motor2.pTerm, 6);
+  Serial.print(",");
+  Serial.print(motor2.iTerm, 6);
+  Serial.print(",");
+  Serial.print(motor2.vTerm, 6);
+  Serial.print(",");
+  Serial.print(motor2.intErr, 6);
+  Serial.print(",");
+  Serial.print(motor2.rawOut, 6);
+  Serial.print(",");
+  Serial.print(motor2.satOut, 6);
+  Serial.print(",");
+  Serial.print(motor2.satState);
+  Serial.print(",");
+  Serial.print(motor2.pwmLim);
+  Serial.print(",");
+  Serial.print(motor2.nearOn ? 1 : 0);
+  Serial.print(",");
+  Serial.print(motor2.brakeOn ? 1 : 0);
+  Serial.print(",");
+  Serial.print(motor2.settled ? 1 : 0);
+  Serial.print(",");
+  Serial.print(motor2.ctrlDt, 6);
+  Serial.print(",");
+  Serial.print(motor2.intDt, 6);
+  Serial.print(",");
+  Serial.print(motor2.longGap ? 1 : 0);
+  Serial.print(",");
+  Serial.print(motor2.rawVTerm, 6);
+  Serial.print(",");
+  Serial.print(motor2.velLimOn ? 1 : 0);
+  Serial.print(",");
+  Serial.print(motor2.dirProtOn ? 1 : 0);
+  Serial.print(",");
+  Serial.println(motor2.oscDir);
+
+  // Read by final_dual_motor_monitor.py.
   // STATE,time_ms,selected,
   // m1_mode,m1_target,m1_current,m1_error,m1_pwm,m1_u,m1_counts,
   // m2_mode,m2_target,m2_current,m2_error,m2_pwm,m2_u,m2_counts,
@@ -1785,58 +2130,58 @@ void printTelemetry() {
   Serial.print("STATE,");
   Serial.print(now);
   Serial.print(",");
-  Serial.print(selectedMotor->name);
+  Serial.print(selMotor->name);
   Serial.print(",");
 
-  Serial.print(controlModeName(motor1));
+  Serial.print(getControlModeName(motor1));
   Serial.print(",");
-  Serial.print(motor1.targetDeg, 4);
+  Serial.print(motor1.tgtAngDeg, 4);
   Serial.print(",");
   Serial.print(m1Current, 4);
   Serial.print(",");
   Serial.print(m1Error, 4);
   Serial.print(",");
-  Serial.print(motor1.pwm);
+  Serial.print(motor1.pwmCommand);
   Serial.print(",");
-  Serial.print(motor1.signedPwmCommand, 2);
+  Serial.print(motor1.pwmCmd, 2);
   Serial.print(",");
-  Serial.print(encoderCounts(motor1));
+  Serial.print(getEncoderCounts(motor1));
   Serial.print(",");
 
-  Serial.print(controlModeName(motor2));
+  Serial.print(getControlModeName(motor2));
   Serial.print(",");
-  Serial.print(motor2.targetDeg, 4);
+  Serial.print(motor2.tgtAngDeg, 4);
   Serial.print(",");
   Serial.print(m2Current, 4);
   Serial.print(",");
   Serial.print(m2Error, 4);
   Serial.print(",");
-  Serial.print(motor2.pwm);
+  Serial.print(motor2.pwmCommand);
   Serial.print(",");
-  Serial.print(motor2.signedPwmCommand, 2);
+  Serial.print(motor2.pwmCmd, 2);
   Serial.print(",");
-  Serial.print(encoderCounts(motor2));
+  Serial.print(getEncoderCounts(motor2));
   Serial.print(",");
 
-  Serial.print(upperArmAngleDeg, 4);
+  Serial.print(upAngDeg, 4);
   Serial.print(",");
-  Serial.print(jointAngleDeg, 4);
+  Serial.print(jntAngDeg, 4);
   Serial.print(",");
-  Serial.println(rejectedSpikes);
+  Serial.println(spikeCnt);
 
-  printQuaternion("qUpperZeroed", qUpperZeroed);
-  printQuaternion("qForearmZeroed", qForearmZeroed);
-  printQuaternion("qJointZeroed", qJointZeroed);
+  printQuaternion("qUpperZeroed", upRelQ);
+  printQuaternion("qForearmZeroed", frRelQ);
+  printQuaternion("qJointZeroed", elbRelQ);
 }
 
 // Prints the available serial commands and current feedback assignments.
 void printMenu() {
   Serial.println();
-  Serial.println("========== FINAL DUAL-MOTOR CONTROLLER ==========");
+  Serial.println("========== DUAL-MOTOR CONTROLLER ==========");
   Serial.println("j       : Select Motor 1");
   Serial.println("k       : Select Motor 2");
   Serial.println("0-9     : Set selected motor to a preset target");
-  Serial.println("x       : Start/stop angle + velocity oscillation tracking");
+  Serial.println("x       : Start or stop smooth oscillation");
   Serial.println("left / a : Selected motor reverse/down at manual PWM");
   Serial.println("right / d: Selected motor forward/up at manual PWM");
   Serial.println("s/e/p   : Emergency stop both motors");
@@ -1845,18 +2190,18 @@ void printMenu() {
   Serial.println("m       : Print this menu");
   Serial.println();
   Serial.print("Motor 1 feedback: ");
-  Serial.println(feedbackName(motor1));
+  Serial.println(getFeedbackName(motor1));
   Serial.print("Motor 2 feedback: ");
-  Serial.println(feedbackName(motor2));
+  Serial.println(getFeedbackName(motor2));
   Serial.print("Currently selected: ");
-  Serial.println(selectedMotor->name);
+  Serial.println(selMotor->name);
   Serial.print("Motor 2 lower encoder limit counts: ");
-  Serial.println(M2_LOWER_LIMIT_COUNTS);
+  Serial.println(M2_LOW);
   Serial.print("Motor 2 upper safe angle: ");
-  Serial.print(ELBOW_MAX_SAFE_DEG, 1);
+  Serial.print(ELB_MAX, 1);
   Serial.println(" deg");
   Serial.print("Elbow automatic zero correction: ");
-  Serial.println(ENABLE_ELBOW_AUTO_ZERO ? "enabled" : "disabled");
+  Serial.println(AUTO_ZERO ? "enabled" : "disabled");
   Serial.println("=================================================");
   Serial.println();
 }
@@ -1869,7 +2214,7 @@ void printMenu() {
 // It starts serial communication, prepares the motor pins, starts the IMUs,
 // clears both controllers, and prints the command menu.
 void setup() {
-  Serial.begin(SERIAL_BAUD);
+  Serial.begin(BAUD_RATE);
 
   pinMode(M1_IN1, OUTPUT);
   pinMode(M1_IN2, OUTPUT);
@@ -1889,16 +2234,16 @@ void setup() {
   resetControllerState(motor1, true);
   resetControllerState(motor2, true);
 
-  lastControlUs = micros();
-  lastTelemetryMs = 0;
+  lastCtrlUs = micros();
+  lastSendMs = 0;
 
   printMenu();
 
-  if (imuOk && AUTO_START_MOTOR_1_OSCILLATION) {
+  if (imusReady && AUTO_M1) {
     startOscillation(motor1);
   }
 
-  if (imuOk && AUTO_START_MOTOR_2_OSCILLATION) {
+  if (imusReady && AUTO_M2) {
     startOscillation(motor2);
   }
 }
@@ -1911,26 +2256,29 @@ void loop() {
 
   unsigned long nowUs = micros();
 
-  // Continue printing telemetry while waiting for the next 100 Hz control
+  // Continue printing live data while waiting for the next 100 Hz control
   // update. Returning here prevents the PID from running too quickly.
-  if (nowUs - lastControlUs < CONTROL_PERIOD_US) {
+  if (nowUs - lastCtrlUs < CTRL_US) {
     printTelemetry();
     return;
   }
 
-  float dtSeconds =
-      (nowUs - lastControlUs) / 1000000.0;
-  lastControlUs = nowUs;
+  float ctrlDt =
+      (nowUs - lastCtrlUs) / 1000000.0;
+  lastCtrlUs = nowUs;
 
-  if (dtSeconds <= 0.0) {
-    dtSeconds = CONTROL_PERIOD_US / 1000000.0;
+  if (ctrlDt <= 0.0) {
+    ctrlDt = CTRL_US / 1000000.0;
   }
 
-  // Limit an unusually large dt after a pause or delay. A very large dt can
-  // create a large integral update and an unsafe output change.
-  if (dtSeconds > 0.05) {
-    dtSeconds = 0.05;
-  }
+  bool longGap =
+      ctrlDt > GAP_SEC;
+
+  // Preserve actual dt for velocity. Skip integration after a long gap so a
+  // delayed loop cannot create an abrupt stored-error increase.
+  float intDt = longGap
+      ? 0.0
+      : min(ctrlDt, MAX_INT_DT);
 
   // Sensor readings must be updated before target error is calculated.
   readImus();
@@ -1949,10 +2297,20 @@ void loop() {
   updateManualDrive(motor1);
   updateManualDrive(motor2);
 
-  // Each motor uses the same PID function but has independent settings and
-  // independent saved state. updatePid() returns immediately in manual mode.
-  updatePid(motor1, dtSeconds);
-  updatePid(motor2, dtSeconds);
+  // Each motor uses the same feedback-control function but has independent
+  // settings and saved state. updateMotorController() returns immediately in manual mode.
+  updateMotorController(
+      motor1,
+      ctrlDt,
+      intDt,
+      longGap
+  );
+  updateMotorController(
+      motor2,
+      ctrlDt,
+      intDt,
+      longGap
+  );
 
   printTelemetry();
 }
