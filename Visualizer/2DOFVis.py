@@ -36,8 +36,8 @@ FOREARM_IMU_TO_HAND = 4
 # Do not change this just to change the visual rest direction.
 IMU_SEGMENT_AXIS_LOCAL = np.array([1.0, 0.0, 0.0])
 
-# Display-only offset: rotate the correctly tracked +X arm direction so that
-# the zero/rest pose appears straight down along world -Z.
+# Display-only offset: Used to set the "Zero Position" 
+# to straight down, this section adjusts the world frame
 # This is a +90 degree rotation about world Y: +X -> -Z.
 Q_DISPLAY_OFFSET = np.array([-0.7071067811865476, 0.0, 0.7071067811865476, 0.0])
 
@@ -50,7 +50,7 @@ def quat_multiply(q1, q2):
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
     ])
-
+# This is a 90 deg rotation about the new world z axis
 Q_DISPLAY_OFFSET = quat_multiply(
      [-0.7071067811865476, 0.0, 0.0, 0.7071067811865476],
      Q_DISPLAY_OFFSET)
@@ -112,6 +112,7 @@ def quat_conjugate(q):
     return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
+# This function was moved up to rotate world frame
 # def quat_multiply(q1, q2):
 #     w1, x1, y1, z1 = q1
 #     w2, x2, y2, z2 = q2
@@ -337,6 +338,7 @@ def main():
     rotation_ax.grid(True, alpha=0.3)
     rotation_ax.set_ylim(-5, 5)
 
+    # c clears telemetry, g clears graphs, r resets imus, q quits
     def on_key(event):
         nonlocal history_start_time
 
@@ -378,6 +380,7 @@ def main():
 
         forearm_line.set_data([elbow[0], hand[0]], [elbow[1], hand[1]])
         forearm_line.set_3d_properties([elbow[2], hand[2]])
+        # change to adjust arm plane size, currently 2.5 inches wide
         half_width = 1.25
         upper_plane_corners = [
             shoulder - half_width * upper_width_dir,
