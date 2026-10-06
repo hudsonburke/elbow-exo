@@ -569,6 +569,18 @@ void updateTrial() {
 // Serial / logging
 // ======================================================
 
+void printQuat(const char* label, Quat q) {
+  Serial.print(label);
+  Serial.print(": ");
+  Serial.print(q.w, 6);
+  Serial.print(",");
+  Serial.print(q.x, 6);
+  Serial.print(",");
+  Serial.print(q.y, 6);
+  Serial.print(",");
+  Serial.println(q.z, 6);
+}
+
 void printData() {
   unsigned long now = millis();
   if ((now - lastDataMs) < DATA_MS) {
@@ -608,6 +620,8 @@ void printData() {
   Serial.print(modeName());
   Serial.print(",");
   Serial.println(trialId);
+  printQuat("qUpperZeroed", qUpZeroed);
+  printQuat("qForearmZeroed", qForeZeroed);
 }
 
 void printMenu() {
@@ -694,6 +708,8 @@ void handleSerial() {
     }
   }
 }
+
+
 
 // ======================================================
 // Arduino

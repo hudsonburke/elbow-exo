@@ -144,6 +144,12 @@ def quaternion_angle_degrees(quaternion):
 
 FLOAT_PATTERN = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
 
+DATA_PATTERN = re.compile(
+    rf"^DATA,({FLOAT_PATTERN}),({FLOAT_PATTERN}),({FLOAT_PATTERN}),"
+    rf"(-?\d+),(-?\d+),({FLOAT_PATTERN}),"
+    rf"({FLOAT_PATTERN}),({FLOAT_PATTERN}),(-?\d+),([^,]+),(\d+)$"
+)
+
 QUATERNION_LINE_PATTERN = re.compile(
     rf"^\s*(qUpperZeroed|qForearmZeroed|qJointZeroed)\s*:\s*"
     rf"({FLOAT_PATTERN}),\s*({FLOAT_PATTERN}),\s*"
@@ -257,10 +263,40 @@ def read_serial_lines(connection):
 # Serial parsing
 # =====================================================
 
+
+
+
 def parse_serial_line(line):
     telemetry["lines_read"] += 1
 
     quaternion_match = QUATERNION_LINE_PATTERN.search(line)
+
+    data_match = DATA_PATTERN.match(line)
+
+    if data_match:
+        (
+            time_s,
+            theta,
+            raw_theta,
+            motor_1,
+            motor_2,
+            cable_change,
+            u_cmd,
+            u_eff,
+            pwm,
+            state,
+            trial_id,
+        ) = data_match.groups()
+
+        telemetry["current_angle"] = float(theta)
+        telemetry["pwm"] = int(pwm)
+        telemetry["pwm_norm"] = abs(int(pwm)) / 255.0
+        telemetry["u_cmd"] = float(u_cmd)
+        telemetry["mode"] = state
+        telemetry["motor_1_counts"] = int(motor_1)
+        telemetry["motor_2_counts"] = int(motor_2)
+
+        return
 
     if quaternion_match:
         label = quaternion_match.group(1)
