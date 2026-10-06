@@ -168,7 +168,23 @@ void process_line(char *line){
   char cmd = tolower((unsigned char)*line++);
   while (*line && isspace((unsigned char)*line)) line++;
 
-  if (cmd=='z'){ long c1,c2; ATOMIC_READ({ c1=pos1_i; c2=pos2_i; }); angle_set_zero_here(M1,c1,0.0f); angle_set_zero_here(M2,c2,0.0f); return; }
+  if (cmd=='z'){
+    long c1,c2;
+    ATOMIC_READ({ c1=pos1_i; c2=pos2_i; });
+    angle_set_zero_here(M1,c1,0.0f);
+    angle_set_zero_here(M2,c2,0.0f);
+    active = NONE;
+    m1_state = IDLE;
+    m2_state = IDLE;
+    i1_acc = 0.0f;
+    i2_acc = 0.0f;
+    last_pwm1 = 0;
+    last_pwm2 = 0;
+    setMotor1(0,0);
+    setMotor2(0,0);
+    Serial.println("EVENT,zeroed");
+    return;
+  }
 
   char *endp=nullptr;
   double a1=strtod(line,&endp); bool have_high=(endp!=line);
@@ -197,10 +213,6 @@ void pollSerialLine(){
   static char ibuf[40]; static uint8_t n=0;
   while (Serial.available()){
     char c = Serial.read();
-    if ((c=='w'||c=='W') && n==0){ char t[]="w"; process_line(t); continue; }
-    if ((c=='e'||c=='E') && n==0){ char t[]="e"; process_line(t); continue; }
-    if ((c=='a'||c=='A') && n==0){ char t[]="a"; process_line(t); continue; }
-    if ((c=='z'||c=='Z') && n==0){ char t[]="z"; process_line(t); continue; }
     if (c=='\r'||c=='\n'){ ibuf[n]='\0'; if(n>0) process_line(ibuf); n=0; continue; }
     if (n < sizeof(ibuf)-1) ibuf[n++]=c; else n=0;
   }
