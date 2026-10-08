@@ -400,7 +400,7 @@ MotorController motor2 = {
 
 // Existing target mapping is preserved: key 0 means 5 degrees.
 const float TGT_LIST[10] = {
-  5.0, 10.0, 20.0, 30.0, 40.0,
+  0.0, 10.0, 20.0, 30.0, 40.0, // naz_edit: here changed the initial 0 angle to 0.0 instead of 5.0
   50.0, 60.0, 70.0, 80.0, 90.0
 };
 

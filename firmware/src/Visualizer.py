@@ -49,7 +49,8 @@ import serial
 # =====================================================
 
 # Change this when the controller appears on a different COM port.
-SER_PORT = "/dev/cu.usbmodem202183301"
+port1 = "/dev/cu.usbmodem202183301"
+SER_PORT = port1
 BAUD_RATE = 230400
 SER_TOUT = 0.1
 
