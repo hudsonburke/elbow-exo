@@ -203,9 +203,15 @@ const int MANUAL_PWM = 125;
 // the same orientation drift as the IMUs. The upper limit uses the corrected
 // elbow angle and can optionally also use an encoder count after calibration.
 
-const float ELB_MIN = 0.0;
-const float ELB_MAX = 100.0;
-const float ELB_REL = 98.0;
+// const float ELB_MIN = 0.0;
+// const float ELB_MAX = 100.0;
+// const float ELB_REL = 98.0;
+
+// naz_edit: adding more physical limits for elbow
+const float ELB_MIN = 3.0f;
+const float ELB_MAX = 135.0f;
+const float ELB_MIN_REL = 5.0f;
+const float ELB_REL = 132.0f;
 
 // At full extension, encoder2 is set to zero.
 // The enter and release margins stop the limit from turning on and off quickly.
@@ -222,7 +228,7 @@ const long M2_UP_REL = 89000;
 // Automatic elbow-only zero correction.
 // The encoder must remain at the lower limit while the elbow is nearly still.
 // This corrects IMU drift without changing Motor 1's IMU reference.
-const bool AUTO_ZERO = true;
+const bool AUTO_ZERO = false; //naz_edit: temporary change 
 const unsigned long LOW_HOLDMS = 400;
 const unsigned long ZERO_WAIT = 2000;
 const float LOW_VEL = 1.0;
@@ -463,6 +469,7 @@ QuaternionData conjugateQuaternion(QuaternionData q);
 QuaternionData multiplyQuaternions(QuaternionData a, QuaternionData b);
 QuaternionData fromBnoQuaternion(imu::Quaternion q);
 float quaternionAngleDeg(QuaternionData q);
+float signedQuaternionAngleDeg(QuaternionData q);
 
 void resetJointAngleFilter(float startDeg);
 float filterJointAngle(float rawDeg);
@@ -580,6 +587,40 @@ float quaternionAngleDeg(QuaternionData q) {
   return 2.0 * acos(w) * 180.0 / PI;
 }
 
+
+// naz_edit: adding quaternionAngleDeg that doesn't do magnitude 
+const float HINGE_X = 0.0f;
+const float HINGE_Y = 0.0f; 
+const float HINGE_Z = 1.0f;// naz_edit: changed from 0.0f to 1.0f to match the hinge axis of the elbow, and made x = 0.0f from 1.0f
+
+float signedQuaternionAngleDeg(QuaternionData q) {
+  q = normalizeQuaternion(q);
+
+  // Choose one consistent quaternion representation.
+  if (q.w < 0.0f) {
+    q.w = -q.w;
+    q.x = -q.x;
+    q.y = -q.y;
+    q.z = -q.z;
+  }
+
+  // Full rotation magnitude.
+  float magnitudeDeg =
+      2.0f * acos(constrain(q.w, -1.0f, 1.0f))
+      * 180.0f / PI;
+
+  // Use the hinge axis only for direction.
+  float axisComponent =
+      q.x * HINGE_X +
+      q.y * HINGE_Y +
+      q.z * HINGE_Z;
+
+  if (axisComponent < 0.0f) {
+    return -magnitudeDeg;
+  }
+
+  return magnitudeDeg;
+}
 
 // IMU filtering
 
@@ -702,7 +743,8 @@ void readImus() {
       conjugateQuaternion(upRelQ), frRelQ);
 
   upAngDeg = quaternionAngleDeg(upRelQ);
-  rawJntDeg = quaternionAngleDeg(elbRelQ);
+  // rawJntDeg = quaternionAngleDeg(elbRelQ);
+  rawJntDeg = signedQuaternionAngleDeg(elbRelQ); // naz_edit: using signed quaternion angle for elbow
 
   // First filter the uncorrected relative IMU angle. Then subtract the
   // encoder-confirmed drift offset. This keeps filtering and drift correction
@@ -833,19 +875,48 @@ bool isMotor2(const MotorController& motor) {
 // every negative encoder value as being at the lower limit, which could block
 // reverse/down movement during the entire range of motion when the encoder
 // direction was negative.
+// bool readMotor2LowerLimit() {
+//   long curCnt = getEncoderCounts(motor2);
+//   long lowDist = labs(
+//       curCnt - M2_LOW
+//   );
+
+//   if (m2LowOn) {
+//     return lowDist <=
+//         M2_LOW_OUT;
+//   }
+
+//   return lowDist <=
+//       M2_LOW_IN;
+// }
+
+// naz_edit: adding what Claude suggeted for lower limit check, 
+// using both encoder and angle limit with different thresholds for entering and exiting the limit state
+
 bool readMotor2LowerLimit() {
   long curCnt = getEncoderCounts(motor2);
-  long lowDist = labs(
-      curCnt - M2_LOW
-  );
+
+  long lowDist = labs(curCnt - M2_LOW);
+
+  bool encoderLimit;
 
   if (m2LowOn) {
-    return lowDist <=
-        M2_LOW_OUT;
+    encoderLimit = lowDist <= M2_LOW_OUT;
+  } else {
+    encoderLimit = lowDist <= M2_LOW_IN;
   }
 
-  return lowDist <=
-      M2_LOW_IN;
+  bool angleLimit;
+
+  if (m2LowOn) {
+    // Stay in the lower-limit state until the joint moves above 5 degrees.
+    angleLimit = jntAngDeg <= ELB_MIN_REL;
+  } else {
+    // Activate the lower limit at 3 degrees or below.
+    angleLimit = jntAngDeg <= ELB_MIN;
+  }
+
+  return encoderLimit || angleLimit;
 }
 
 // Reads the upper elbow safety limit with a small release margin.
@@ -949,7 +1020,7 @@ void correctElbowZeroAtLowerLimit() {
 
   // filtJntDeg is the filtered angle before offset subtraction.
   // Saving it as the offset makes the corrected elbow angle equal to zero.
-  elbZeroDeg = filtJntDeg;
+  elbZeroDeg = filtJntDeg - ELB_MIN; // naz_edit: changed from 0.0 to ELB_MIN to match the new physical limit
   jntAngDeg = ELB_MIN;
 
   // Re-anchor the encoder at the known mechanical lower limit.
