@@ -1,0 +1,47 @@
+
+#include <Wire.h>
+
+void scanBus(TwoWire &bus, const char *name) {
+  Serial.print("\nScanning ");
+  Serial.println(name);
+
+  int found = 0;
+
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    bus.beginTransmission(addr);
+    uint8_t error = bus.endTransmission();
+
+    if (error == 0) {
+      Serial.print("Found I2C device: 0x");
+      Serial.println(addr, HEX);
+      found++;
+    }
+  }
+
+  if (found == 0) {
+    Serial.println("No devices found!");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Wire.begin();   // SDA 18, SCL 19
+  Wire1.begin();  // SDA 17, SCL 16
+  Wire2.begin();  // SDA 25, SCL 24
+
+  Wire.setClock(100000);
+  Wire1.setClock(100000);
+  Wire2.setClock(100000);
+
+  Serial.println("Teensy 4.1 I2C Scanner");
+}
+
+void loop() {
+  scanBus(Wire, "Wire");
+  scanBus(Wire1, "Wire1");
+  scanBus(Wire2, "Wire2");
+
+  delay(3000);
+}
